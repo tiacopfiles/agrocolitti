@@ -1,0 +1,802 @@
+<?php
+
+/**
+ * SicoobBoletoService (procedural, espelhando focus/focus_nfe_service.php).
+ *
+ * Responsavel pela camada HTTP com a API de Cobranca Bancaria V3 do SICOOB,
+ * pelo log de cada chamada em boleto_tentativas e pela persistencia em boletos.
+ *
+ * NUNCA loga senha de certificado nem access_token (ver sicoob_auth_service).
+ */
+
+require_once __DIR__ . '/sicoob_config.php';
+require_once __DIR__ . '/sicoob_auth_service.php';
+
+
+if (!function_exists('sicoobFormatarCpfCnpj')) {
+    function sicoobFormatarCpfCnpj(string $valor): string
+    {
+        $d = preg_replace('/\D/', '', $valor);
+        if (strlen($d) === 11) {
+            return substr($d,0,3).'.'.substr($d,3,3).'.'.substr($d,6,3).'-'.substr($d,9,2);
+        }
+        if (strlen($d) === 14) {
+            return substr($d,0,2).'.'.substr($d,2,3).'.'.substr($d,5,3).'/'.substr($d,8,4).'-'.substr($d,12,2);
+        }
+        return $d !== '' ? $d : $valor;
+    }
+}
+
+if (!function_exists('sicoobFormatarCep')) {
+    function sicoobFormatarCep(string $valor): string
+    {
+        $d = preg_replace('/\D/', '', $valor);
+        if (strlen($d) === 8) {
+            return substr($d,0,5).'-'.substr($d,5,3);
+        }
+        return $d !== '' ? $d : $valor;
+    }
+}
+if (!function_exists('sicoobSomenteDigitos')) {
+    function sicoobSomenteDigitos(?string $valor): string
+    {
+        return preg_replace('/\D/', '', (string) $valor);
+    }
+}
+
+if (!function_exists('sicoobBoletoHttp')) {
+    /**
+     * Espelha focusNfeHttp: faz a chamada e devolve http_code/json/raw/error/url.
+     * Aplica headers de auth + certificado (producao) via sicoobAuthContexto().
+     */
+    function sicoobBoletoHttp(array $config, string $metodo, string $path, ?array $payload = null): array
+    {
+        $url = rtrim($config['api_url'], '/') . $path;
+        $auth = sicoobAuthContexto($config);
+
+        $ch = curl_init($url);
+        $headers = $auth['headers'];
+        $options = [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 60,
+            CURLOPT_CUSTOMREQUEST  => $metodo,
+        ];
+        if ($payload !== null) {
+            $headers[] = 'Content-Type: application/json';
+            $options[CURLOPT_POSTFIELDS] = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        $options[CURLOPT_HTTPHEADER] = $headers;
+        foreach ($auth['curl'] as $opt => $val) {
+            $options[$opt] = $val;
+        }
+        curl_setopt_array($ch, $options);
+        $body = curl_exec($ch);
+        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        return [
+            'http_code' => $httpCode,
+            'raw'       => $body === false ? '' : (string) $body,
+            'json'      => $body !== false ? json_decode((string) $body, true) : null,
+            'error'     => $body === false ? $error : '',
+            'url'       => $url,
+        ];
+    }
+}
+
+if (!function_exists('sicoobBoletoRegistrarTentativa')) {
+    /**
+     * Espelha focusNfeRegistrarTentativa. NUNCA grava headers de auth.
+     */
+    function sicoobBoletoRegistrarTentativa(mysqli $conexao, ?int $boletoId, ?string $seuNumero, string $tipo, string $metodo, string $endpoint, ?int $httpCode, ?array $payload, ?string $resposta, ?string $erro): void
+    {
+        $payloadJson = $payload !== null ? json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
+        $stmt = $conexao->prepare(
+            'INSERT INTO boleto_tentativas
+             (boleto_id, seu_numero, tipo, metodo_http, endpoint, http_code, payload_resumido, resposta_json, erro)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        $stmt->bind_param('issssisss', $boletoId, $seuNumero, $tipo, $metodo, $endpoint, $httpCode, $payloadJson, $resposta, $erro);
+        $stmt->execute();
+        $stmt->close();
+    }
+}
+
+if (!function_exists('sicoobBoletoMontarPagador')) {
+    /**
+     * Monta o objeto "pagador" (V3, aninhado) a partir do payload da NFe
+     * (nfe_documentos.payload_json) — o boleto e o espelho financeiro da nota.
+     */
+    function sicoobBoletoMontarPagador(array $nfePayload): array
+    {
+        $cpfCnpj = sicoobFormatarCpfCnpj(
+            (string) ($nfePayload['cnpj_destinatario'] ?? $nfePayload['cpf_destinatario'] ?? '')
+        );
+
+        $logradouro = trim((string) ($nfePayload['logradouro_destinatario'] ?? ''));
+        $numero     = trim((string) ($nfePayload['numero_destinatario'] ?? ''));
+        $endereco   = trim($logradouro . ($numero !== '' ? ', ' . $numero : ''));
+
+        return [
+            'numeroCpfCnpj' => $cpfCnpj,
+            'nome'          => mb_substr((string) ($nfePayload['nome_destinatario'] ?? ''), 0, 50),
+            'endereco'      => mb_substr($endereco !== '' ? $endereco : 'NAO INFORMADO', 0, 40),
+            'bairro'        => mb_substr((string) ($nfePayload['bairro_destinatario'] ?? 'NAO INFORMADO'), 0, 30),
+            'cidade'        => mb_substr((string) ($nfePayload['municipio_destinatario'] ?? 'NAO INFORMADO'), 0, 40),
+            'cep'           => sicoobSomenteDigitos((string) ($nfePayload['cep_destinatario'] ?? '')),
+            'uf'            => strtoupper(mb_substr((string) ($nfePayload['uf_destinatario'] ?? ''), 0, 2)),
+        ];
+    }
+}
+
+if (!function_exists('sicoobBoletoValorDaNfe')) {
+    /**
+     * Valor total da nota a partir do payload da NF-e (soma dos itens).
+     * Fonte do valor do boleto quando a tabela `vendas` nao tem as linhas da OS
+     * (caso producao). O boleto e o espelho financeiro da nota, entao a soma dos
+     * itens (= valor_bruto, que ja e quantidade x valor unitario) e o valor correto.
+     */
+    function sicoobBoletoValorDaNfe(array $nfePayload): float
+    {
+        $total = 0.0;
+        if (isset($nfePayload['items']) && is_array($nfePayload['items'])) {
+            foreach ($nfePayload['items'] as $it) {
+                if (isset($it['valor_bruto']) && $it['valor_bruto'] !== '') {
+                    $total += (float) $it['valor_bruto'];
+                } elseif (isset($it['quantidade_comercial']) && isset($it['valor_unitario_comercial'])) {
+                    $total += (float) $it['quantidade_comercial'] * (float) $it['valor_unitario_comercial'];
+                }
+            }
+        }
+        return round($total, 2);
+    }
+}
+
+if (!function_exists('sicoobBoletoMontarPayload')) {
+    /**
+     * Monta o payload V3 de inclusao de boleto.
+     * Estrutura VERIFICADA — nomes V3, pagador aninhado, hibrido=true (PIX).
+     */
+    function sicoobBoletoMontarPayload(array $config, string $seuNumero, float $valor, string $dataVencimento, array $pagador, ?string $dataEmissao = null, array $mensagens = []): array
+    {
+        if (empty($mensagens)) {
+            $mensagens = ['Pagavel preferencialmente nas cooperativas do Sicoob'];
+        }
+        // Sicoob aceita no maximo 5 linhas de instrucao.
+        $mensagens = array_slice(array_values(array_map('strval', $mensagens)), 0, 5);
+
+        // Juros/multa incidem a partir do dia seguinte ao vencimento (como no boleto real).
+        $dataEncargo = date('Y-m-d', strtotime($dataVencimento . ' +1 day'));
+
+        $payload = [
+            'numeroCliente'                  => (int) $config['numero_cliente'],
+            'codigoModalidade'               => (int) $config['codigo_modalidade'],
+            'numeroContaCorrente'            => (int) sicoobSomenteDigitos($config['numero_conta']),
+            'codigoEspecieDocumento'         => (isset($config['codigo_especie']) && $config['codigo_especie'] !== '') ? (string) $config['codigo_especie'] : 'DM',
+            'dataEmissao'                    => $dataEmissao ?: date('Y-m-d'),
+            'seuNumero'                      => $seuNumero,
+            'identificacaoEmissaoBoleto'     => 1,
+            'identificacaoDistribuicaoBoleto' => 1,
+            'numeroParcela'                  => 1,
+            'tipoDesconto'                   => 0,
+            'valor'                          => round($valor, 2),
+            'dataVencimento'                 => $dataVencimento,
+            'aceite'                         => true,
+            'pagador'                        => $pagador,
+            'mensagensInstrucao'             => $mensagens,
+            'gerarPdf'                       => true,
+        ];
+
+        // Nosso Numero: por padrao o Sicoob gera (sequencia da carteira). So enviamos
+        // se o usuario forcou um valor no rascunho (campo editavel, opcional).
+        if (isset($config['nosso_numero']) && trim((string) $config['nosso_numero']) !== '') {
+            $nn = sicoobSomenteDigitos((string) $config['nosso_numero']);
+            if ($nn !== '') { $payload['nossoNumero'] = (int) $nn; }
+        }
+
+        // Juros (tipoJurosMora: 1=valor/dia, 2=taxa mensal %, 3=isento). Default config 2.
+        $jurosTipo = (int) ($config['juros_tipo'] ?? 0);
+        $jurosValor = (float) ($config['juros_valor'] ?? 0);
+        if ($jurosTipo > 0 && $jurosValor > 0) {
+            $payload['tipoJurosMora']  = $jurosTipo;
+            $payload['dataJurosMora']  = $dataEncargo;
+            $payload['valorJurosMora'] = round($jurosValor, 2);
+        }
+
+        // Multa (tipoMulta: 1=valor fixo, 2=percentual, 0=isento). Default config 2.
+        $multaTipo = (int) ($config['multa_tipo'] ?? 0);
+        $multaValor = (float) ($config['multa_valor'] ?? 0);
+        if ($multaTipo > 0 && $multaValor > 0) {
+            $payload['tipoMulta']  = $multaTipo;
+            $payload['dataMulta']  = $dataEncargo;
+            $payload['valorMulta'] = round($multaValor, 2);
+        }
+
+        return $payload;
+    }
+}
+
+if (!function_exists('sicoobBoletoExtrairResultado')) {
+    /**
+     * Extrai os campos do retorno (vem aninhado em "resultado").
+     */
+    function sicoobBoletoExtrairResultado(?array $json): array
+    {
+        $r = is_array($json) && isset($json['resultado']) && is_array($json['resultado'])
+            ? $json['resultado']
+            : (is_array($json) ? $json : []);
+
+        $pix = '';
+        if (isset($r['qrCode'])) {
+            $pix = (string) $r['qrCode'];
+        } elseif (isset($r['pix']) && is_array($r['pix'])) {
+            $pix = (string) ($r['pix']['emv'] ?? $r['pix']['copiaECola'] ?? '');
+        }
+
+        return [
+            'nossoNumero'    => (string) ($r['nossoNumero'] ?? ''),
+            'linhaDigitavel' => (string) ($r['linhaDigitavel'] ?? ''),
+            'codigoBarras'   => (string) ($r['codigoBarras'] ?? ''),
+            'pixCopiaCola'   => $pix,
+            'pdfBase64'      => (string) ($r['pdfBoleto'] ?? $r['pdf'] ?? ''),
+        ];
+    }
+}
+
+if (!function_exists('sicoobBoletoSalvarPdf')) {
+    /**
+     * Decodifica o pdfBoleto (base64) e salva em storage/boletos/.
+     * Retorna o caminho relativo salvo, ou '' se nao houver PDF.
+     */
+    function sicoobBoletoSalvarPdf(string $pdfBase64, string $seuNumero): string
+    {
+        if ($pdfBase64 === '') {
+            return '';
+        }
+        $bin = base64_decode($pdfBase64, true);
+        if ($bin === false || $bin === '') {
+            return '';
+        }
+        $pdfPos = strpos($bin, '%PDF');
+        if ($pdfPos === false) {
+            return '';
+        }
+        if ($pdfPos > 0) {
+            $bin = substr($bin, $pdfPos);
+        }
+        $eofPos = strrpos($bin, '%%EOF');
+        if ($eofPos !== false) {
+            $bin = substr($bin, 0, $eofPos + 5);
+        }
+        $dir = dirname(__DIR__) . '/storage/boletos';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0775, true);
+        }
+        $nomeArquivo = 'boleto_' . preg_replace('/[^A-Za-z0-9_\-]/', '_', $seuNumero) . '_' . date('YmdHis') . '.pdf';
+        $caminho = $dir . '/' . $nomeArquivo;
+        if (@file_put_contents($caminho, $bin) === false) {
+            return '';
+        }
+        return 'storage/boletos/' . $nomeArquivo;
+    }
+}
+
+if (!function_exists('sicoobBoletoMontarMensagens')) {
+    /**
+     * Monta as linhas de instrucao do boleto a partir da config (juros/multa) + NF-e.
+     * Centralizado para a tela de rascunho e a emissao usarem o mesmo texto.
+     */
+    function sicoobBoletoMontarMensagens(array $config, string $numeroNfe, string $dataVencimento = ''): array
+    {
+        // Juros/multa passam a incidir no dia seguinte ao vencimento (como no boleto real).
+        $dataEncargoFmt = $dataVencimento !== '' ? date('d/m/Y', strtotime($dataVencimento . ' +1 day')) : '';
+        $prefixo = $dataEncargoFmt !== '' ? ('A partir ' . $dataEncargoFmt . ' ') : 'Apos o vencimento ';
+        $fmtNum = function ($n) { return str_replace('.', ',', rtrim(rtrim(number_format((float) $n, 2, '.', ''), '0'), '.')); };
+
+        $mensagens = [];
+        // Instrucao 1: Juros (ex.: "A partir 03/07/2026 Juros 0,07%/dia")
+        if ((int) ($config['juros_tipo'] ?? 0) > 0 && (float) ($config['juros_valor'] ?? 0) > 0) {
+            $jurosDia = (float) ($config['juros_dia'] ?? 0);
+            $mensagens[] = $prefixo . ($jurosDia > 0 ? ('Juros ' . $fmtNum($jurosDia) . '%/dia') : 'Juros conforme contrato');
+        }
+        // Instrucao 2: Multa (ex.: "A partir 03/07/2026 Multa de 5%")
+        if ((int) ($config['multa_tipo'] ?? 0) > 0 && (float) ($config['multa_valor'] ?? 0) > 0) {
+            $mensagens[] = $prefixo . 'Multa de ' . $fmtNum($config['multa_valor']) . '%';
+        }
+        // Instrucao 3: Desconto
+        $mensagens[] = 'Nao conceder desconto';
+        // Instrucao 4: Referencia da NF-e
+        if ($numeroNfe !== '') {
+            $mensagens[] = 'Ref. emissao da NF-e ' . $numeroNfe;
+        }
+        return $mensagens;
+    }
+}
+
+if (!function_exists('sicoobBoletoPrepararDados')) {
+    /**
+     * Centraliza o preparo dos dados do boleto a partir da OS (NF-e autorizada).
+     * Usado tanto pela tela de RASCUNHO quanto pela EMISSAO, para nao divergir.
+     * Lanca RuntimeException com mensagem clara em caso de problema.
+     */
+    function sicoobBoletoPrepararDados(mysqli $conexao, string $numeroOs, ?int $vendaId = null, ?string $vencimentoOverride = null, ?string $ambiente = null): array
+    {
+        $config = sicoobBoletoConfig($ambiente);
+
+        // 1) NF-e de venda autorizada da OS
+        $stmt = $conexao->prepare(
+            'SELECT id, numero_nfe, ref, payload_json FROM nfe_documentos
+             WHERE numero_os = ? AND tipo_emissao = "venda" AND status = "autorizada"
+             ORDER BY id DESC LIMIT 1'
+        );
+        $stmt->bind_param('s', $numeroOs);
+        $stmt->execute();
+        $nfe = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$nfe) {
+            throw new RuntimeException('OS sem NF-e autorizada. Emita a nota antes de gerar o boleto.');
+        }
+
+        // 2) Boleto ja existente para a OS?
+        $stmt = $conexao->prepare('SELECT id, situacao FROM boletos WHERE numero_os = ? AND situacao IN ("registrado","emitido") LIMIT 1');
+        $stmt->bind_param('s', $numeroOs);
+        $stmt->execute();
+        $jaExiste = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+
+        // 3) Pagador (a partir do payload da NF-e — o boleto e o espelho da nota)
+        $nfePayload = json_decode((string) $nfe['payload_json'], true);
+        if (!is_array($nfePayload)) {
+            throw new RuntimeException('Nao foi possivel ler os dados do destinatario da NF-e.');
+        }
+        $pagador = sicoobBoletoMontarPagador($nfePayload);
+        if (($pagador['numeroCpfCnpj'] ?? '') === '') {
+            throw new RuntimeException('NF-e sem CPF/CNPJ do destinatario — nao da para gerar o boleto.');
+        }
+
+        // 4) Valor = soma dos itens da OS, usando a MESMA logica da tela de historico
+        //    (valor_final_editado quando existir; senao calcularPrecoTotalVenda()).
+        if (!function_exists('calcularPrecoTotalVenda')) {
+            require_once __DIR__ . '/../vendas/venda_helper.php';
+        }
+        $stmt = $conexao->prepare(
+            'SELECT v.*, p.unidade AS produto_unidade
+             FROM vendas v LEFT JOIN produtos p ON p.id = v.produto_id
+             WHERE v.numero_os = ?'
+        );
+        $stmt->bind_param('s', $numeroOs);
+        $stmt->execute();
+        $rsVendas = $stmt->get_result();
+        $valor = 0.0;
+        $prazoStr = '';
+        while ($it = $rsVendas->fetch_assoc()) {
+            $valor += (isset($it['valor_final_editado']) && $it['valor_final_editado'] !== null)
+                ? (float) $it['valor_final_editado']
+                : calcularPrecoTotalVenda($it);
+            // captura o prazo escolhido na venda (ex.: "30_dias", "5 dias", "45")
+            if ($prazoStr === '') {
+                $prazoStr = trim((string) ($it['prazo_escolhido'] ?? '')) !== ''
+                    ? (string) $it['prazo_escolhido']
+                    : (string) ($it['prazo_pagamento'] ?? '');
+            }
+        }
+        $stmt->close();
+        $valor = round($valor, 2);
+        // Em PRODUCAO a tabela `vendas` pode estar vazia (as vendas nao persistem apos a
+        // emissao da NF-e). Nesse caso o valor vem da propria NF-e — soma dos itens do
+        // payload — que e exatamente o que o boleto espelha. Mantem compatibilidade com o
+        // ambiente de dev (onde `vendas` esta populado e tem o caminho acima).
+        if ($valor <= 0) {
+            $valor = sicoobBoletoValorDaNfe($nfePayload);
+        }
+        if ($valor <= 0) {
+            throw new RuntimeException('Valor da OS igual a zero — sem itens na venda nem na NF-e.');
+        }
+
+        // 5) Data de emissao = conforme a nota (campo data_emissao do payload da NF-e).
+        $dataEmissaoNota = date('Y-m-d');
+        if (!empty($nfePayload['data_emissao'])) {
+            $tsEmissao = strtotime((string) $nfePayload['data_emissao']);
+            if ($tsEmissao) {
+                $dataEmissaoNota = date('Y-m-d', $tsEmissao);
+            }
+        }
+
+        // 6) Vencimento = data de emissao da nota + prazo escolhido na venda (5/30/45...).
+        //    Override da tela de rascunho sempre vence. Sem prazo identificavel -> padrao config.
+        $prazoDias = preg_match('/(\d+)/', $prazoStr, $mPz) ? (int) $mPz[1] : 0;
+        $dias = $prazoDias > 0 ? $prazoDias : (int) ($config['dias_vencimento'] ?? 30);
+        if ($vencimentoOverride !== null && preg_match('/^\d{4}-\d{2}-\d{2}$/', $vencimentoOverride)) {
+            $dataVencimento = $vencimentoOverride;
+        } else {
+            $dataVencimento = date('Y-m-d', strtotime($dataEmissaoNota . ' +' . $dias . ' days'));
+        }
+
+        // 7) seuNumero = numero da NF-e (igual ao "N. documento" do boleto real); fallback OS-x.
+        //    O "Nosso Numero" e gerado pelo Sicoob e volta na resposta (nao enviamos).
+        $numeroNfe = trim((string) ($nfe['numero_nfe'] ?? ''));
+        $seuNumero = $numeroNfe !== '' ? $numeroNfe : ('OS-' . $numeroOs);
+
+        // 8) Mensagens de instrucao (4 linhas, espelham o boleto real; data = vencimento+1)
+        $mensagens = sicoobBoletoMontarMensagens($config, $numeroNfe, $dataVencimento);
+
+        return [
+            'config'           => $config,
+            'numero_os'        => $numeroOs,
+            'venda_id'         => $vendaId,
+            'nfe_documento_id' => (int) $nfe['id'],
+            'numero_nfe'       => $numeroNfe,
+            'seu_numero'       => $seuNumero,
+            'pagador'          => $pagador,
+            'valor'            => round($valor, 2),
+            'data_emissao'     => $dataEmissaoNota,
+            'data_vencimento'  => $dataVencimento,
+            'dias_vencimento'  => $dias,
+            'mensagens'        => $mensagens,
+            'ja_existe'        => $jaExiste ?: null,
+        ];
+    }
+}
+
+if (!function_exists('sicoobBoletoIncluir')) {
+    /**
+     * Inclui um boleto na API SICOOB e persiste em `boletos`.
+     * Espelha focusNfeEmitirVenda: cria registro, chama API, loga, atualiza.
+     *
+     * @param array $dados {
+     *   numero_os: string, venda_id: ?int, nfe_documento_id: ?int,
+     *   valor: float, data_vencimento: string (YYYY-MM-DD),
+     *   pagador: array (saida de sicoobBoletoMontarPagador)
+     * }
+     */
+    function sicoobBoletoIncluir(mysqli $conexao, array $dados, ?string $ambiente = null, array $configOverride = []): array
+    {
+        $config = sicoobBoletoConfig($ambiente);
+        // Permite sobrescrever campos da config (numero_cliente, conta, juros, multa)
+        // a partir da tela de rascunho, sem mexer no .env.
+        if (!empty($configOverride)) {
+            foreach ($configOverride as $k => $v) {
+                if ($v !== null && $v !== '') {
+                    $config[$k] = $v;
+                }
+            }
+        }
+
+        $numeroOs = (string) ($dados['numero_os'] ?? '');
+        $seuNumero = (string) ($dados['seu_numero'] ?? ('OS-' . $numeroOs));
+        $valor = (float) ($dados['valor'] ?? 0);
+        $dataVencimento = (string) ($dados['data_vencimento'] ?? date('Y-m-d', strtotime('+7 days')));
+        $pagador = (array) ($dados['pagador'] ?? []);
+        $mensagens = isset($dados['mensagens']) && is_array($dados['mensagens']) ? $dados['mensagens'] : [];
+        $dataEmissao = isset($dados['data_emissao']) && $dados['data_emissao'] !== '' ? (string) $dados['data_emissao'] : null;
+
+        if ($valor <= 0) {
+            throw new RuntimeException('SICOOB: valor do boleto deve ser maior que zero.');
+        }
+        if (($pagador['numeroCpfCnpj'] ?? '') === '') {
+            throw new RuntimeException('SICOOB: pagador sem CPF/CNPJ (verifique a NFe da OS).');
+        }
+        if ((int) $config['numero_cliente'] <= 0) {
+            throw new RuntimeException('SICOOB: SICOOB_NUMERO_CLIENTE nao preenchido (contrato de cobranca).');
+        }
+
+        $payload = sicoobBoletoMontarPayload($config, $seuNumero, $valor, $dataVencimento, $pagador, $dataEmissao, $mensagens);
+
+        // Cria o registro local (rascunho) antes da chamada — igual a Focus.
+        $boletoId = sicoobBoletoCriarRegistro($conexao, $config, $dados, $seuNumero, $valor, $dataVencimento, $pagador, $payload);
+
+        $path = '/boletos';
+        $res = sicoobBoletoHttp($config, 'POST', $path, $payload);
+        sicoobBoletoRegistrarTentativa($conexao, $boletoId, $seuNumero, 'incluir', 'POST', $path, $res['http_code'], $payload, $res['raw'], $res['error']);
+
+        $resultado = sicoobBoletoExtrairResultado(is_array($res['json']) ? $res['json'] : null);
+        $sucesso = $res['http_code'] >= 200 && $res['http_code'] < 300 && $resultado['linhaDigitavel'] !== '';
+
+        $pdfPath = '';
+        if ($sucesso && $resultado['pdfBase64'] !== '') {
+            $pdfPath = sicoobBoletoSalvarPdf($resultado['pdfBase64'], $seuNumero);
+        }
+
+        sicoobBoletoAtualizarRetorno($conexao, $boletoId, $res, $resultado, $pdfPath, $sucesso);
+
+        return [
+            'boleto_id'  => $boletoId,
+            'seu_numero' => $seuNumero,
+            'http_code'  => $res['http_code'],
+            'sucesso'    => $sucesso,
+            'resultado'  => $resultado,
+            'pdf_path'   => $pdfPath,
+            'response'   => $res['json'],
+            'raw'        => $res['raw'],
+            'error'      => $res['error'],
+        ];
+    }
+}
+
+if (!function_exists('sicoobBoletoCriarRegistro')) {
+    function sicoobBoletoCriarRegistro(mysqli $conexao, array $config, array $dados, string $seuNumero, float $valor, string $dataVencimento, array $pagador, array $payload): int
+    {
+        $numeroOs = (string) ($dados['numero_os'] ?? '') ?: null;
+        $vendaId  = isset($dados['venda_id']) ? (int) $dados['venda_id'] : null;
+        $nfeId    = isset($dados['nfe_documento_id']) ? (int) $dados['nfe_documento_id'] : null;
+        $payloadJson = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $dataEmissao = date('Y-m-d');
+        $situacao = 'rascunho';
+        $numeroCliente = (string) $config['numero_cliente'];
+        $numeroConta = (string) $config['numero_conta'];
+        $cooperativa = (string) $config['cooperativa'];
+        $modalidade = (int) $config['codigo_modalidade'];
+        $ambiente = (string) $config['ambiente'];
+        $pagNome = (string) ($pagador['nome'] ?? '');
+        $pagDoc  = (string) ($pagador['numeroCpfCnpj'] ?? '');
+
+        $stmt = $conexao->prepare(
+            'INSERT INTO boletos
+             (numero_os, venda_id, nfe_documento_id, ambiente, seu_numero, numero_cliente,
+              codigo_modalidade, numero_conta, cooperativa, valor, data_emissao, data_vencimento,
+              situacao, pagador_nome, pagador_cpf_cnpj, payload_envio)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        );
+        // Tipos: numero_os(s) venda_id(i) nfe_id(i) ambiente(s) seu_numero(s)
+        //        numero_cliente(s) modalidade(i) numero_conta(s) cooperativa(s)
+        //        valor(d) data_emissao(s) data_vencimento(s) situacao(s)
+        //        pagador_nome(s) pagador_cpf_cnpj(s) payload_envio(s)
+        $stmt->bind_param(
+            'siisssissdssssss',
+            $numeroOs, $vendaId, $nfeId, $ambiente, $seuNumero, $numeroCliente,
+            $modalidade, $numeroConta, $cooperativa, $valor, $dataEmissao, $dataVencimento,
+            $situacao, $pagNome, $pagDoc, $payloadJson
+        );
+        $stmt->execute();
+        $id = (int) $conexao->insert_id;
+        $stmt->close();
+        return $id;
+    }
+}
+
+if (!function_exists('sicoobBoletoAtualizarRetorno')) {
+    function sicoobBoletoAtualizarRetorno(mysqli $conexao, int $boletoId, array $res, array $resultado, string $pdfPath, bool $sucesso): void
+    {
+        $situacao = $sucesso ? 'registrado' : 'erro';
+        $nossoNumero = $resultado['nossoNumero'];
+        $linha = $resultado['linhaDigitavel'];
+        $barras = $resultado['codigoBarras'];
+        $pix = $resultado['pixCopiaCola'];
+        $retornoJson = $res['raw'];
+        $mensagem = $sucesso ? '' : sicoobBoletoMensagemErro($res);
+
+        $stmt = $conexao->prepare(
+            'UPDATE boletos
+             SET situacao = ?, nosso_numero = ?, linha_digitavel = ?, codigo_barras = ?,
+                 pix_copia_cola = ?, pdf_path = ?, payload_retorno = ?, mensagem = ?
+             WHERE id = ?'
+        );
+        $stmt->bind_param('ssssssssi', $situacao, $nossoNumero, $linha, $barras, $pix, $pdfPath, $retornoJson, $mensagem, $boletoId);
+        $stmt->execute();
+        $stmt->close();
+    }
+}
+
+if (!function_exists('sicoobBoletoMensagemErro')) {
+    function sicoobBoletoMensagemErro(array $res): string
+    {
+        $json = $res['json'];
+        if (is_array($json)) {
+            if (!empty($json['mensagens']) && is_array($json['mensagens'])) {
+                $msgs = array_map(static fn($m) => is_array($m) ? ($m['mensagem'] ?? json_encode($m)) : (string) $m, $json['mensagens']);
+                return implode(' | ', $msgs);
+            }
+            foreach (['mensagem', 'message', 'erro', 'error'] as $k) {
+                if (!empty($json[$k]) && is_string($json[$k])) {
+                    return $json[$k];
+                }
+            }
+        }
+        if (!empty($res['error'])) {
+            return $res['error'];
+        }
+        return 'SICOOB retornou HTTP ' . $res['http_code'] . '.';
+    }
+}
+
+if (!function_exists('sicoobBoletoConsultar')) {
+    /**
+     * Consulta um boleto por nossoNumero (espelha focusNfeConsultarRef).
+     */
+    function sicoobBoletoConsultar(mysqli $conexao, int $boletoId, ?string $ambiente = null): array
+    {
+        $config = sicoobBoletoConfig($ambiente);
+
+        $stmt = $conexao->prepare('SELECT nosso_numero, seu_numero FROM boletos WHERE id = ? LIMIT 1');
+        $stmt->bind_param('i', $boletoId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$row) {
+            throw new RuntimeException('Boleto nao encontrado: ' . $boletoId);
+        }
+
+        $nossoNumero = sicoobSomenteDigitos((string) $row['nosso_numero']);
+        if ($nossoNumero === '') {
+            throw new RuntimeException('Este boleto nao tem "nosso numero" (a emissao falhou ou nao foi concluida) — nao ha o que consultar no Sicoob.');
+        }
+        $conta = sicoobSomenteDigitos($config['numero_conta']);
+        $path = '/boletos?numeroCliente=' . (int) $config['numero_cliente']
+              . '&codigoModalidade=' . (int) $config['codigo_modalidade']
+              . '&nossoNumero=' . $nossoNumero;
+
+        $res = sicoobBoletoHttp($config, 'GET', $path, null);
+        sicoobBoletoRegistrarTentativa($conexao, $boletoId, (string) $row['seu_numero'], 'consultar', 'GET', $path, $res['http_code'], null, $res['raw'], $res['error']);
+
+        return [
+            'boleto_id' => $boletoId,
+            'http_code' => $res['http_code'],
+            'response'  => $res['json'],
+            'raw'       => $res['raw'],
+            'error'     => $res['error'],
+        ];
+    }
+}
+
+if (!function_exists('sicoobBoletoBaixar')) {
+    /**
+     * Comanda a BAIXA (cancelamento) de um boleto ja registrado no Sicoob.
+     * Endpoint V3: POST /boletos/{nossoNumero}/baixar (body: numeroCliente + codigoModalidade).
+     * TESTADO em producao 2026-06-10: POST a um boleto inexistente devolve 400
+     * "Boleto nao encontrado" (endpoint+escopo OK); PATCH devolve 405. Logo o metodo e POST.
+     *
+     * ESCOPO: NAO existe escopo "boletos_baixa" no realm do Sicoob (token retorna
+     * invalid_scope). A baixa e uma ALTERACAO do boleto -> coberta por "boletos_alteracao",
+     * que o app ja possui (confirmado: a chamada nao retorna 401/403).
+     *
+     * Usa o ambiente em que o boleto foi gerado (coluna boletos.ambiente), para nao
+     * tentar baixar em producao um boleto criado no sandbox e vice-versa.
+     */
+    function sicoobBoletoBaixar(mysqli $conexao, int $boletoId, ?string $ambiente = null): array
+    {
+        $stmt = $conexao->prepare('SELECT nosso_numero, seu_numero, situacao, ambiente, numero_cliente, codigo_modalidade FROM boletos WHERE id = ? LIMIT 1');
+        $stmt->bind_param('i', $boletoId);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        $stmt->close();
+        if (!$row) {
+            throw new RuntimeException('Boleto nao encontrado: ' . $boletoId);
+        }
+
+        $situacaoAtual = (string) ($row['situacao'] ?? '');
+        if ($situacaoAtual === 'baixado') {
+            throw new RuntimeException('Este boleto ja esta baixado/cancelado.');
+        }
+        if (!in_array($situacaoAtual, ['registrado', 'emitido'], true)) {
+            throw new RuntimeException('So e possivel cancelar um boleto registrado no Sicoob (situacao atual: ' . ($situacaoAtual ?: 'desconhecida') . ').');
+        }
+
+        $nossoNumero = sicoobSomenteDigitos((string) $row['nosso_numero']);
+        if ($nossoNumero === '') {
+            throw new RuntimeException('Boleto sem "nosso numero" do Sicoob — nada para cancelar (verifique se o registro foi confirmado).');
+        }
+
+        // Ambiente do proprio boleto (override do parametro vence, p/ testes).
+        $config = sicoobBoletoConfig($ambiente ?: (string) ($row['ambiente'] ?: ''));
+
+        // Cliente/modalidade gravados no boleto tem prioridade (espelham a inclusao).
+        $numeroCliente = (int) ($row['numero_cliente'] ?: $config['numero_cliente']);
+        $modalidade    = (int) ($row['codigo_modalidade'] ?: $config['codigo_modalidade']);
+
+        $payload = [
+            'numeroCliente'    => $numeroCliente,
+            'codigoModalidade' => $modalidade,
+        ];
+
+        $metodoBaixa = 'POST'; // V3: POST /boletos/{nossoNumero}/baixar (testado em producao: PATCH retorna 405).
+        $path = '/boletos/' . $nossoNumero . '/baixar';
+        $res = sicoobBoletoHttp($config, $metodoBaixa, $path, $payload);
+        sicoobBoletoRegistrarTentativa($conexao, $boletoId, (string) $row['seu_numero'], 'baixar', $metodoBaixa, $path, $res['http_code'], $payload, $res['raw'], $res['error']);
+
+        $sucesso = $res['http_code'] >= 200 && $res['http_code'] < 300;
+        if ($sucesso) {
+            $novaSituacao = 'baixado';
+            $msg = 'Boleto baixado/cancelado no Sicoob em ' . date('d/m/Y H:i') . '.';
+            $up = $conexao->prepare('UPDATE boletos SET situacao = ?, mensagem = ? WHERE id = ?');
+            $up->bind_param('ssi', $novaSituacao, $msg, $boletoId);
+            $up->execute();
+            $up->close();
+        }
+
+        return [
+            'boleto_id' => $boletoId,
+            'http_code' => $res['http_code'],
+            'sucesso'   => $sucesso,
+            'response'  => $res['json'],
+            'raw'       => $res['raw'],
+            'error'     => $res['error'],
+            'mensagem'  => $sucesso ? '' : sicoobBoletoMensagemErro($res),
+        ];
+    }
+}
+
+
+if (!function_exists('sicoobBoletoSincronizarTodos')) {
+    /**
+     * Consulta o status de cada boleto registrado/emitido no Sicoob e
+     * atualiza a situacao no banco caso tenha mudado.
+     *
+     * Mapeamento situacaoBoleto (Sicoob) -> situacao (local):
+     *   "Em Aberto" -> sem alteracao
+     *   "Baixado"   -> cancelado (baixa manual ou automatica)
+     *   "Liquidado" -> baixado   (pagamento confirmado)
+     */
+    function sicoobBoletoSincronizarTodos(mysqli $conexao): array
+    {
+        $config = sicoobBoletoConfig(null);
+
+        $stmt = $conexao->prepare(
+            "SELECT id, nosso_numero, seu_numero, situacao FROM boletos
+             WHERE situacao IN ('registrado','emitido') AND nosso_numero <> ''
+             ORDER BY id DESC"
+        );
+        $stmt->execute();
+        $boletos = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+
+        $verificados = count($boletos);
+        $atualizados = 0;
+        $detalhes    = [];
+
+        foreach ($boletos as $b) {
+            $nossoNumero = sicoobSomenteDigitos((string) $b['nosso_numero']);
+            $path = '/boletos?numeroCliente=' . (int) $config['numero_cliente']
+                  . '&codigoModalidade=' . (int) $config['codigo_modalidade']
+                  . '&nossoNumero=' . $nossoNumero;
+
+            $res = sicoobBoletoHttp($config, 'GET', $path, null);
+
+            $situacaoSicoob = '';
+            $novaSituacao   = null;
+
+            if ($res['http_code'] === 200 && is_array($res['json'])) {
+                $resultado      = $res['json']['resultado'] ?? [];
+                $situacaoSicoob = (string) ($resultado['situacaoBoleto'] ?? '');
+
+                if ($situacaoSicoob === 'Liquidado') {
+                    $novaSituacao = 'baixado';
+                } elseif ($situacaoSicoob === 'Baixado') {
+                    $novaSituacao = 'cancelado';
+                }
+            }
+
+            $detalhe = [
+                'id'              => (int) $b['id'],
+                'nosso_numero'    => (string) $b['nosso_numero'],
+                'situacao_local'  => (string) $b['situacao'],
+                'situacao_sicoob' => $situacaoSicoob,
+                'atualizado'      => false,
+                'nova_situacao'   => null,
+            ];
+
+            if ($novaSituacao !== null && $novaSituacao !== $b['situacao']) {
+                $msgMap = [
+                    'baixado'   => 'Liquidado (pago) no Sicoob em ' . date('d/m/Y H:i') . '.',
+                    'cancelado' => 'Baixado/cancelado no Sicoob em ' . date('d/m/Y H:i') . '.',
+                ];
+                $mensagem = $msgMap[$novaSituacao] ?? ('Atualizado via sync em ' . date('d/m/Y H:i') . '.');
+                $up = $conexao->prepare('UPDATE boletos SET situacao = ?, mensagem = ? WHERE id = ?');
+                $up->bind_param('ssi', $novaSituacao, $mensagem, $b['id']);
+                $up->execute();
+                $up->close();
+                $atualizados++;
+                $detalhe['atualizado']    = true;
+                $detalhe['nova_situacao'] = $novaSituacao;
+            }
+
+            $detalhes[] = $detalhe;
+        }
+
+        return [
+            'verificados' => $verificados,
+            'atualizados' => $atualizados,
+            'detalhes'    => $detalhes,
+        ];
+    }
+}

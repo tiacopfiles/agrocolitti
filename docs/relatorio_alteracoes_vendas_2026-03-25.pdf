@@ -1,0 +1,182 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+2 0 obj
+<< /Length 3394 >>
+stream
+BT
+/F1 10 Tf
+1 0 0 1 50 780 Tm (RELATORIO DE ALTERACOES - MODULO DE VENDAS) Tj
+1 0 0 1 50 765 Tm (Data: 2026-03-25) Tj
+1 0 0 1 50 750 Tm (Projeto: AgroColitti) Tj
+1 0 0 1 50 735 Tm () Tj
+1 0 0 1 50 720 Tm (OBJETIVO) Tj
+1 0 0 1 50 705 Tm (Implementar o envio do tipo selecionado no formulario de vendas, calcular a quantidade final em kg com base em quantidade x kg por caixa ou quantidade x gramagem, exibir corretamente essas informacoes em Vendas Pendentes e preparar o banco para armazenar o tipo da venda.) Tj
+1 0 0 1 50 690 Tm () Tj
+1 0 0 1 50 675 Tm (ARQUIVO: vendas/vendas.php) Tj
+1 0 0 1 50 660 Tm (O que foi alterado:) Tj
+1 0 0 1 50 645 Tm (- Foi criada a funcao formatarTipoVenda\(\).) Tj
+1 0 0 1 50 630 Tm (- O select de tipo passou a enviar valores reais: bandeja, caixa e kg.) Tj
+1 0 0 1 50 615 Tm (- O campo auxiliar foi corrigido para usar o nome peso_unitario em vez de repetir o name pedido.) Tj
+1 0 0 1 50 600 Tm (- Foi adicionada a funcao JavaScript atualizarCamposTipo\(\).) Tj
+1 0 0 1 50 585 Tm (- O formulario agora muda dinamicamente o label e a ajuda do campo de peso conforme o tipo escolhido.) Tj
+1 0 0 1 50 570 Tm (- A tabela de Vendas Pendentes foi corrigida para exibir cliente, tipo e quantidade nas colunas certas.) Tj
+1 0 0 1 50 555 Tm () Tj
+1 0 0 1 50 540 Tm (Problema anterior:) Tj
+1 0 0 1 50 525 Tm (- O dropdown Tipo tinha option com value vazio, entao o backend nao recebia o tipo.) Tj
+1 0 0 1 50 510 Tm (- O input Quantidade e o input Kg Caixa/Gramagem usavam o mesmo name pedido, entao um campo sobrescrevia o outro.) Tj
+1 0 0 1 50 495 Tm (- Na tabela de pendentes, cliente e tipo estavam invertidos na renderizacao.) Tj
+1 0 0 1 50 480 Tm () Tj
+1 0 0 1 50 465 Tm (Logica aplicada:) Tj
+1 0 0 1 50 450 Tm (- Se o tipo for bandeja, a tela pede a gramagem em gramas.) Tj
+1 0 0 1 50 435 Tm (- Se o tipo for caixa, a tela pede o kg por caixa.) Tj
+1 0 0 1 50 420 Tm (- Se o tipo for kg, o campo de peso unitario fica desabilitado porque nao e necessario.) Tj
+1 0 0 1 50 405 Tm (- A funcao formatarTipoVenda\(\) tambem serve como compatibilidade para vendas antigas que ainda nao tenham a coluna tipo preenchida: ela infere o tipo pela existencia de gramagem ou kg_caixa.) Tj
+1 0 0 1 50 390 Tm () Tj
+1 0 0 1 50 375 Tm (ARQUIVO: vendas/salvar_venda.php) Tj
+1 0 0 1 50 360 Tm (O que foi alterado:) Tj
+1 0 0 1 50 345 Tm (- Foi criada a funcao colunaTipoExiste\(\) para detectar se a coluna tipo ja existe no banco.) Tj
+1 0 0 1 50 330 Tm (- O backend passou a receber tipo, pedido e peso_unitario corretamente.) Tj
+1 0 0 1 50 315 Tm (- O calculo de quantidade_total foi separado por tipo de venda.) Tj
+1 0 0 1 50 300 Tm (- O insert na tabela vendas agora usa dois caminhos:) Tj
+1 0 0 1 50 285 Tm (  1. Se a coluna tipo existir, grava tipo, gramagem, kg_caixa, pedido e quantidade.) Tj
+1 0 0 1 50 270 Tm (  2. Se a coluna tipo ainda nao existir, continua gravando sem quebrar o sistema.) Tj
+1 0 0 1 50 255 Tm () Tj
+1 0 0 1 50 240 Tm (Logica do calculo:) Tj
+1 0 0 1 50 225 Tm (- Tipo caixa:) Tj
+1 0 0 1 50 210 Tm (  quantidade_total = pedido x kg_caixa) Tj
+1 0 0 1 50 195 Tm () Tj
+1 0 0 1 50 180 Tm (- Tipo bandeja:) Tj
+1 0 0 1 50 165 Tm (  quantidade_total = pedido x gramagem / 1000) Tj
+1 0 0 1 50 150 Tm (  A divisao por 1000 converte gramas para kg.) Tj
+1 0 0 1 50 135 Tm () Tj
+1 0 0 1 50 120 Tm (- Tipo kg:) Tj
+1 0 0 1 50 105 Tm (  quantidade_total = pedido) Tj
+ET
+endstream
+endobj
+3 0 obj
+<< /Length 2930 >>
+stream
+BT
+/F1 10 Tf
+1 0 0 1 50 780 Tm () Tj
+1 0 0 1 50 765 Tm (Validacoes adicionadas:) Tj
+1 0 0 1 50 750 Tm (- produto_id e cliente_id precisam ser validos.) Tj
+1 0 0 1 50 735 Tm (- pedido precisa ser maior que zero.) Tj
+1 0 0 1 50 720 Tm (- tipo precisa ser um dos valores permitidos.) Tj
+1 0 0 1 50 705 Tm (- para caixa, peso_unitario precisa ser maior que zero.) Tj
+1 0 0 1 50 690 Tm (- para bandeja, peso_unitario precisa ser maior que zero.) Tj
+1 0 0 1 50 675 Tm (- continua existindo a validacao de estoque antes de salvar.) Tj
+1 0 0 1 50 660 Tm () Tj
+1 0 0 1 50 645 Tm (ARQUIVO: vendas/ajuste_tipo_vendas.sql) Tj
+1 0 0 1 50 630 Tm (O que foi criado:) Tj
+1 0 0 1 50 615 Tm (- Um script SQL para adicionar a coluna tipo na tabela vendas.) Tj
+1 0 0 1 50 600 Tm (- Um update para preencher vendas antigas com um tipo inferido.) Tj
+1 0 0 1 50 585 Tm () Tj
+1 0 0 1 50 570 Tm (Logica do preenchimento legado:) Tj
+1 0 0 1 50 555 Tm (- Se gramagem > 0, assume bandeja.) Tj
+1 0 0 1 50 540 Tm (- Se kg_caixa > 0, assume caixa.) Tj
+1 0 0 1 50 525 Tm (- Caso contrario, assume kg.) Tj
+1 0 0 1 50 510 Tm () Tj
+1 0 0 1 50 495 Tm (Motivo:) Tj
+1 0 0 1 50 480 Tm (- A tabela vendas ja possuia gramagem, kg_caixa, pedido e quantidade, mas nao tinha uma coluna especifica para guardar o tipo da venda.) Tj
+1 0 0 1 50 465 Tm (- Sem essa coluna, o sistema consegue calcular, mas nao consegue persistir o tipo de forma explicita para consultas, listagens e exportacoes futuras.) Tj
+1 0 0 1 50 450 Tm () Tj
+1 0 0 1 50 435 Tm (ARQUIVO: agrocolitti.sql) Tj
+1 0 0 1 50 420 Tm (O que foi alterado:) Tj
+1 0 0 1 50 405 Tm (- A estrutura da tabela vendas no dump foi atualizada com a coluna tipo.) Tj
+1 0 0 1 50 390 Tm () Tj
+1 0 0 1 50 375 Tm (Motivo:) Tj
+1 0 0 1 50 360 Tm (- Isso garante que novas instalacoes do sistema ja criem a tabela com o modelo correto, sem depender apenas do ALTER TABLE manual.) Tj
+1 0 0 1 50 345 Tm () Tj
+1 0 0 1 50 330 Tm (ESTRUTURA FINAL DE DADOS) Tj
+1 0 0 1 50 315 Tm (Campos relevantes em vendas apos o ajuste:) Tj
+1 0 0 1 50 300 Tm (- tipo: identifica se a venda foi feita por bandeja, caixa ou kg.) Tj
+1 0 0 1 50 285 Tm (- gramagem: usado quando o tipo for bandeja.) Tj
+1 0 0 1 50 270 Tm (- kg_caixa: usado quando o tipo for caixa.) Tj
+1 0 0 1 50 255 Tm (- pedido: quantidade informada pelo usuario.) Tj
+1 0 0 1 50 240 Tm (- quantidade: quantidade final em kg, usada para estoque e confirmacao.) Tj
+1 0 0 1 50 225 Tm () Tj
+1 0 0 1 50 210 Tm (FLUXO FINAL DA VENDA) Tj
+1 0 0 1 50 195 Tm (1. Usuario seleciona produto, cliente e tipo.) Tj
+1 0 0 1 50 180 Tm (2. Usuario informa a quantidade.) Tj
+1 0 0 1 50 165 Tm (3. Usuario informa o peso unitario quando necessario.) Tj
+1 0 0 1 50 150 Tm (4. Backend calcula a quantidade final em kg.) Tj
+1 0 0 1 50 135 Tm (5. Backend valida o estoque.) Tj
+1 0 0 1 50 120 Tm (6. Venda fica pendente.) Tj
+1 0 0 1 50 105 Tm (7. A listagem mostra produto, cliente, tipo e quantidade em kg.) Tj
+ET
+endstream
+endobj
+4 0 obj
+<< /Length 1561 >>
+stream
+BT
+/F1 10 Tf
+1 0 0 1 50 780 Tm (8. Depois da foto e confirmacao, a quantidade em kg e abatida do estoque.) Tj
+1 0 0 1 50 765 Tm () Tj
+1 0 0 1 50 750 Tm (BANCO DE DADOS: PRECISA ALTERAR?) Tj
+1 0 0 1 50 735 Tm (Resposta curta: sim, o ideal e adicionar a coluna tipo na tabela vendas.) Tj
+1 0 0 1 50 720 Tm () Tj
+1 0 0 1 50 705 Tm (Sem a coluna tipo:) Tj
+1 0 0 1 50 690 Tm (- O sistema continua funcionando com compatibilidade.) Tj
+1 0 0 1 50 675 Tm (- Mas o tipo nao fica salvo explicitamente em todas as vendas novas.) Tj
+1 0 0 1 50 660 Tm () Tj
+1 0 0 1 50 645 Tm (Com a coluna tipo:) Tj
+1 0 0 1 50 630 Tm (- A listagem fica consistente.) Tj
+1 0 0 1 50 615 Tm (- Exportacoes futuras ficam melhores.) Tj
+1 0 0 1 50 600 Tm (- Fica mais facil filtrar e auditar vendas por tipo.) Tj
+1 0 0 1 50 585 Tm () Tj
+1 0 0 1 50 570 Tm (SQL RECOMENDADO) Tj
+1 0 0 1 50 555 Tm (ALTER TABLE vendas) Tj
+1 0 0 1 50 540 Tm (ADD COLUMN tipo VARCHAR\(20\) NULL AFTER cliente_id;) Tj
+1 0 0 1 50 525 Tm () Tj
+1 0 0 1 50 510 Tm (UPDATE vendas) Tj
+1 0 0 1 50 495 Tm (SET tipo = CASE) Tj
+1 0 0 1 50 480 Tm (    WHEN gramagem IS NOT NULL AND gramagem > 0 THEN 'bandeja') Tj
+1 0 0 1 50 465 Tm (    WHEN kg_caixa IS NOT NULL AND kg_caixa > 0 THEN 'caixa') Tj
+1 0 0 1 50 450 Tm (    ELSE 'kg') Tj
+1 0 0 1 50 435 Tm (END) Tj
+1 0 0 1 50 420 Tm (WHERE tipo IS NULL;) Tj
+1 0 0 1 50 405 Tm () Tj
+1 0 0 1 50 390 Tm (VALIDACAO REALIZADA) Tj
+1 0 0 1 50 375 Tm (- php -l vendas/vendas.php) Tj
+1 0 0 1 50 360 Tm (- php -l vendas/salvar_venda.php) Tj
+1 0 0 1 50 345 Tm (- Ambos sem erro de sintaxe.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Pages /Count 3 /Kids [6 0 R 7 0 R 8 0 R] >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 5 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R >> >> /Contents 2 0 R >>
+endobj
+7 0 obj
+<< /Type /Page /Parent 5 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R >> >> /Contents 3 0 R >>
+endobj
+8 0 obj
+<< /Type /Page /Parent 5 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 1 0 R >> >> /Contents 4 0 R >>
+endobj
+9 0 obj
+<< /Type /Catalog /Pages 5 0 R >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000009 00000 n 
+0000000079 00000 n 
+0000003525 00000 n 
+0000006507 00000 n 
+0000008120 00000 n 
+0000008189 00000 n 
+0000008315 00000 n 
+0000008441 00000 n 
+0000008567 00000 n 
+trailer
+<< /Size 10 /Root 9 0 R >>
+startxref
+8616
+%%EOF

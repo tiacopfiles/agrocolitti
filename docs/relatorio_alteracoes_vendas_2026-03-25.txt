@@ -1,0 +1,122 @@
+RELATORIO DE ALTERACOES - MODULO DE VENDAS
+Data: 2026-03-25
+Projeto: AgroColitti
+
+OBJETIVO
+Implementar o envio do tipo selecionado no formulario de vendas, calcular a quantidade final em kg com base em quantidade x kg por caixa ou quantidade x gramagem, exibir corretamente essas informacoes em Vendas Pendentes e preparar o banco para armazenar o tipo da venda.
+
+ARQUIVO: vendas/vendas.php
+O que foi alterado:
+- Foi criada a funcao formatarTipoVenda().
+- O select de tipo passou a enviar valores reais: bandeja, caixa e kg.
+- O campo auxiliar foi corrigido para usar o nome peso_unitario em vez de repetir o name pedido.
+- Foi adicionada a funcao JavaScript atualizarCamposTipo().
+- O formulario agora muda dinamicamente o label e a ajuda do campo de peso conforme o tipo escolhido.
+- A tabela de Vendas Pendentes foi corrigida para exibir cliente, tipo e quantidade nas colunas certas.
+
+Problema anterior:
+- O dropdown Tipo tinha option com value vazio, entao o backend nao recebia o tipo.
+- O input Quantidade e o input Kg Caixa/Gramagem usavam o mesmo name pedido, entao um campo sobrescrevia o outro.
+- Na tabela de pendentes, cliente e tipo estavam invertidos na renderizacao.
+
+Logica aplicada:
+- Se o tipo for bandeja, a tela pede a gramagem em gramas.
+- Se o tipo for caixa, a tela pede o kg por caixa.
+- Se o tipo for kg, o campo de peso unitario fica desabilitado porque nao e necessario.
+- A funcao formatarTipoVenda() tambem serve como compatibilidade para vendas antigas que ainda nao tenham a coluna tipo preenchida: ela infere o tipo pela existencia de gramagem ou kg_caixa.
+
+ARQUIVO: vendas/salvar_venda.php
+O que foi alterado:
+- Foi criada a funcao colunaTipoExiste() para detectar se a coluna tipo ja existe no banco.
+- O backend passou a receber tipo, pedido e peso_unitario corretamente.
+- O calculo de quantidade_total foi separado por tipo de venda.
+- O insert na tabela vendas agora usa dois caminhos:
+  1. Se a coluna tipo existir, grava tipo, gramagem, kg_caixa, pedido e quantidade.
+  2. Se a coluna tipo ainda nao existir, continua gravando sem quebrar o sistema.
+
+Logica do calculo:
+- Tipo caixa:
+  quantidade_total = pedido x kg_caixa
+
+- Tipo bandeja:
+  quantidade_total = pedido x gramagem / 1000
+  A divisao por 1000 converte gramas para kg.
+
+- Tipo kg:
+  quantidade_total = pedido
+
+Validacoes adicionadas:
+- produto_id e cliente_id precisam ser validos.
+- pedido precisa ser maior que zero.
+- tipo precisa ser um dos valores permitidos.
+- para caixa, peso_unitario precisa ser maior que zero.
+- para bandeja, peso_unitario precisa ser maior que zero.
+- continua existindo a validacao de estoque antes de salvar.
+
+ARQUIVO: vendas/ajuste_tipo_vendas.sql
+O que foi criado:
+- Um script SQL para adicionar a coluna tipo na tabela vendas.
+- Um update para preencher vendas antigas com um tipo inferido.
+
+Logica do preenchimento legado:
+- Se gramagem > 0, assume bandeja.
+- Se kg_caixa > 0, assume caixa.
+- Caso contrario, assume kg.
+
+Motivo:
+- A tabela vendas ja possuia gramagem, kg_caixa, pedido e quantidade, mas nao tinha uma coluna especifica para guardar o tipo da venda.
+- Sem essa coluna, o sistema consegue calcular, mas nao consegue persistir o tipo de forma explicita para consultas, listagens e exportacoes futuras.
+
+ARQUIVO: agrocolitti.sql
+O que foi alterado:
+- A estrutura da tabela vendas no dump foi atualizada com a coluna tipo.
+
+Motivo:
+- Isso garante que novas instalacoes do sistema ja criem a tabela com o modelo correto, sem depender apenas do ALTER TABLE manual.
+
+ESTRUTURA FINAL DE DADOS
+Campos relevantes em vendas apos o ajuste:
+- tipo: identifica se a venda foi feita por bandeja, caixa ou kg.
+- gramagem: usado quando o tipo for bandeja.
+- kg_caixa: usado quando o tipo for caixa.
+- pedido: quantidade informada pelo usuario.
+- quantidade: quantidade final em kg, usada para estoque e confirmacao.
+
+FLUXO FINAL DA VENDA
+1. Usuario seleciona produto, cliente e tipo.
+2. Usuario informa a quantidade.
+3. Usuario informa o peso unitario quando necessario.
+4. Backend calcula a quantidade final em kg.
+5. Backend valida o estoque.
+6. Venda fica pendente.
+7. A listagem mostra produto, cliente, tipo e quantidade em kg.
+8. Depois da foto e confirmacao, a quantidade em kg e abatida do estoque.
+
+BANCO DE DADOS: PRECISA ALTERAR?
+Resposta curta: sim, o ideal e adicionar a coluna tipo na tabela vendas.
+
+Sem a coluna tipo:
+- O sistema continua funcionando com compatibilidade.
+- Mas o tipo nao fica salvo explicitamente em todas as vendas novas.
+
+Com a coluna tipo:
+- A listagem fica consistente.
+- Exportacoes futuras ficam melhores.
+- Fica mais facil filtrar e auditar vendas por tipo.
+
+SQL RECOMENDADO
+ALTER TABLE vendas
+ADD COLUMN tipo VARCHAR(20) NULL AFTER cliente_id;
+
+UPDATE vendas
+SET tipo = CASE
+    WHEN gramagem IS NOT NULL AND gramagem > 0 THEN 'bandeja'
+    WHEN kg_caixa IS NOT NULL AND kg_caixa > 0 THEN 'caixa'
+    ELSE 'kg'
+END
+WHERE tipo IS NULL;
+
+VALIDACAO REALIZADA
+- php -l vendas/vendas.php
+- php -l vendas/salvar_venda.php
+- Ambos sem erro de sintaxe.

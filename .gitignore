@@ -1,0 +1,42 @@
+# Credenciais — NUNCA versionar
+.env
+.env.backup*
+.smtp_gmail_app_password.txt
+
+# Certificados e chaves — NUNCA versionar
+/storage/certs/
+/storage/certificados_fornecedores/
+
+# Documentos financeiros reais
+/storage/boletos/
+
+# Restos de diagnóstico
+codex_*.txt
+codex_diag.php
+/storage/codex_diag/
+s.txt
+
+# Dependências
+/vendor/
+
+# Uploads de usuários
+/storage/uploads/
+/uploads_vendas/
+/uploads_relatorios/
+/vendas/uploads_vendas/
+
+# Arquivos temporários
+/storage/temp/
+*.tmp
+*.log
+
+# Editor / SO
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Backups locais
+*.sql.bak
+*.bak

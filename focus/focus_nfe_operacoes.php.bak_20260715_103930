@@ -1,0 +1,975 @@
+<?php
+
+require_once __DIR__ . '/focus_nfe_service.php';
+require_once __DIR__ . '/../previsoes/pedido_compra_helper.php';
+
+function focusNfeCaixasDisponiveis(): array
+{
+    return [
+        'plastica_p' => ['label' => 'Caixa plastica P', 'peso' => 1.350],
+        'plastica_m' => ['label' => 'Caixa plastica M', 'peso' => 2.000],
+        'papelao' => ['label' => 'Caixa de papelao', 'peso' => 0.750],
+    ];
+}
+
+function focusNfeFloat($valor): float
+{
+    if (is_string($valor)) {
+        $valor = str_replace(',', '.', $valor);
+    }
+    return (float) $valor;
+}
+
+function focusNfeNormalizarComparacaoItem(string $valor): string
+{
+    return preg_replace('/\s+/', ' ', mb_strtolower(trim($valor), 'UTF-8'));
+}
+
+function focusNfeCalcularPesoLiquidoItens(array $items): float
+{
+    $peso = 0.0;
+    foreach ($items as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $qtd = focusNfeFloat($item['quantidade_comercial'] ?? 0);
+        $pesoUnitarioKg = focusNfeFloat($item['peso_unitario_kg'] ?? 0);
+        $unidade = strtoupper(trim((string) ($item['unidade_comercial'] ?? '')));
+        if ($pesoUnitarioKg > 0) {
+            $peso += $qtd * $pesoUnitarioKg;
+        } elseif ($unidade === 'KG') {
+            $peso += $qtd;
+        }
+    }
+    return round($peso, 3);
+}
+
+function focusNfeValidarItemFiscalVenda(array $item, int $idx): void
+{
+    $produto = trim((string) ($item['produto_nome_origem'] ?? $item['descricao'] ?? ('item ' . ($idx + 1))));
+    $codigo = trim((string) ($item['codigo_produto'] ?? ''));
+    $codigoDigitos = focusNfeSomenteDigitos($codigo);
+    if ($codigoDigitos === '') {
+        throw new RuntimeException('Produto ' . $produto . ' sem codigo interno para NF-e.');
+    }
+    if (strlen($codigoDigitos) !== 13) {
+        throw new RuntimeException(
+            'Produto ' . $produto .
+            ' com codigo interno invalido para NF-e. O codigo deve ter exatamente 13 digitos; corrija o cadastro do produto antes de emitir.'
+        );
+    }
+
+    $descricao = trim((string) ($item['descricao'] ?? ''));
+    if ($descricao === '') {
+        throw new RuntimeException('Produto ' . $produto . ' sem descricao fiscal para NF-e.');
+    }
+
+    $ncm = focusNfeSomenteDigitos((string) ($item['codigo_ncm'] ?? ''));
+    if (strlen($ncm) !== 8) {
+        throw new RuntimeException('Produto ' . $produto . ' sem NCM valido com 8 digitos.');
+    }
+
+    $cfop = focusNfeSomenteDigitos((string) ($item['cfop'] ?? ''));
+    if (strlen($cfop) !== 4) {
+        throw new RuntimeException('Produto ' . $produto . ' sem CFOP valido para NF-e.');
+    }
+
+    $unidade = strtoupper(trim((string) ($item['unidade_comercial'] ?? '')));
+    if (!in_array($unidade, ['KG', 'UN', 'CX', 'BD'], true)) {
+        throw new RuntimeException('A unidade fiscal do produto ' . $produto . ' e invalida. Use KG, UN, CX ou BD quando for bandeja.');
+    }
+
+    if (focusNfeFloat($item['quantidade_comercial'] ?? 0) <= 0) {
+        throw new RuntimeException('Produto ' . $produto . ' com quantidade fiscal menor ou igual a zero.');
+    }
+}
+
+function focusNfeValidarDestinatarioVenda(array $payload): void
+{
+    $nome = trim((string) ($payload['nome_destinatario'] ?? ''));
+    $cpf = focusNfeSomenteDigitos((string) ($payload['cpf_destinatario'] ?? ''));
+    $cnpj = focusNfeSomenteDigitos((string) ($payload['cnpj_destinatario'] ?? ''));
+    $logradouro = trim((string) ($payload['logradouro_destinatario'] ?? ''));
+    $numero = trim((string) ($payload['numero_destinatario'] ?? ''));
+    $bairro = trim((string) ($payload['bairro_destinatario'] ?? ''));
+    $municipio = trim((string) ($payload['municipio_destinatario'] ?? ''));
+    $uf = strtoupper(trim((string) ($payload['uf_destinatario'] ?? '')));
+    $cep = focusNfeSomenteDigitos((string) ($payload['cep_destinatario'] ?? ''));
+    $indicadorIe = (string) ($payload['indicador_inscricao_estadual_destinatario'] ?? '');
+    $ie = focusNfeSomenteDigitos((string) ($payload['inscricao_estadual_destinatario'] ?? ''));
+
+    if (
+        $nome === ''
+        || (strlen($cpf) !== 11 && strlen($cnpj) !== 14)
+        || $logradouro === ''
+        || $numero === ''
+        || $bairro === ''
+        || $municipio === ''
+        || !preg_match('/^[A-Z]{2}$/', $uf)
+        || strlen($cep) !== 8
+        || $indicadorIe === ''
+        || ($indicadorIe !== '9' && $ie === '')
+    ) {
+        throw new RuntimeException(
+            'Nao foi possivel emitir a NF-e porque o cliente esta com cadastro fiscal incompleto. ' .
+            'Verifique CPF/CNPJ, endereco, numero, bairro, cidade, UF, CEP e inscricao estadual.'
+        );
+    }
+}
+
+function focusNfeUfRegra(?string $uf): string
+{
+    return strtoupper(trim((string) $uf)) === 'SP' ? 'SP' : 'OUTRA_UF';
+}
+
+function focusNfeOperacaoManual(string $tipo, string $uf): array
+{
+    $ufRegra = focusNfeUfRegra($uf);
+    if ($tipo === 'compra') {
+        return ['cfop' => $ufRegra === 'SP' ? '1102' : '2102'];
+    }
+    if ($tipo === 'devolucao_compra') {
+        return ['cfop' => $ufRegra === 'SP' ? '5202' : '6202'];
+    }
+    if ($tipo === 'saida_abate_sem_entrada') {
+        return ['cfop' => $ufRegra === 'SP' ? '5102' : '6102'];
+    }
+    return ['cfop' => $ufRegra === 'SP' ? '5102' : '6102'];
+}
+
+function focusNfeDescricaoCompraSemGramagem(string $descricao): string
+{
+    $descricao = trim($descricao);
+    $descricao = preg_replace('/(^|\s)\d+(?:[.,]\d+)?\s*(?:kg|g|gr|grs|gramas?)\.?(?=\s|$)/iu', ' ', $descricao);
+    return trim(preg_replace('/\s+/', ' ', $descricao));
+}
+
+function focusNfeLocalDestinoFromPost(array $post): ?int
+{
+    if (!isset($post['local_destino']) || $post['local_destino'] === '') {
+        return null;
+    }
+    $localDestino = (int) $post['local_destino'];
+    if (!in_array($localDestino, [1, 2, 3], true)) {
+        throw new RuntimeException('Local de destino invalido para NF-e.');
+    }
+    return $localDestino;
+}
+
+function focusNfeInformacoesAdicionaisFromPost(array $post): string
+{
+    $informacoes = trim((string) ($post['informacoes_adicionais_contribuinte'] ?? ''));
+    if (mb_strlen($informacoes, 'UTF-8') > 2000) {
+        throw new RuntimeException('As informacoes adicionais devem ter no maximo 2000 caracteres.');
+    }
+    return $informacoes;
+}
+
+function focusNfeAplicarVolumes(array $payload, float $pesoLiquido, float $pesoBruto, int $quantidade = 1, string $especie = 'VOLUME'): array
+{
+    $quantidade = max(1, $quantidade);
+    $payload['peso_liquido'] = number_format($pesoLiquido, 3, '.', '');
+    $payload['peso_bruto'] = number_format($pesoBruto, 3, '.', '');
+    $payload['volumes'] = [[
+        'quantidade' => $quantidade,
+        'especie' => $especie !== '' ? mb_substr($especie, 0, 60) : 'VOLUME',
+        'peso_liquido' => number_format($pesoLiquido, 3, '.', ''),
+        'peso_bruto' => number_format($pesoBruto, 3, '.', ''),
+    ]];
+    return $payload;
+}
+
+function focusNfeOpcoesVendaFromPost(array $post): array
+{
+    $tipoCaixa = trim((string) ($post['tipo_caixa'] ?? ''));
+    $quantidadeCaixas = max(0, (int) ($post['quantidade_caixas'] ?? 0));
+    $caixas = focusNfeCaixasDisponiveis();
+    $pesoCaixas = isset($caixas[$tipoCaixa]) ? $quantidadeCaixas * (float) $caixas[$tipoCaixa]['peso'] : 0.0;
+    $localDestino = focusNfeLocalDestinoFromPost($post);
+    $informacoesAdicionais = focusNfeInformacoesAdicionaisFromPost($post);
+    $tipoOperacaoFiscal = trim((string) ($post['tipo_operacao_fiscal'] ?? 'venda'));
+    if (!in_array($tipoOperacaoFiscal, ['venda', 'bonificacao'], true)) {
+        $tipoOperacaoFiscal = 'venda';
+    }
+
+    return [
+        'tipo_operacao_fiscal' => $tipoOperacaoFiscal,
+        'tipo_caixa' => $tipoCaixa,
+        'tipo_caixa_label' => $caixas[$tipoCaixa]['label'] ?? '',
+        'quantidade_caixas' => $quantidadeCaixas,
+        'peso_caixas' => $pesoCaixas,
+        'local_destino' => $localDestino,
+        'informacoes_adicionais_contribuinte' => $informacoesAdicionais,
+        'revisao' => [
+            'destinatario' => is_array($post['destinatario'] ?? null) ? $post['destinatario'] : [],
+            'items' => is_array($post['items'] ?? null) ? $post['items'] : [],
+            'peso_liquido' => $post['peso_liquido'] ?? null,
+            'peso_bruto' => $post['peso_bruto'] ?? null,
+        ],
+    ];
+}
+
+function focusNfeAplicarTipoOperacaoFiscalVenda(array $payload, string $tipoOperacaoFiscal): array
+{
+    if ($tipoOperacaoFiscal !== 'bonificacao') {
+        return $payload;
+    }
+
+    $localDestino = (int) ($payload['local_destino'] ?? 0);
+    $foraEstado = $localDestino === 2 || strtoupper(trim((string) ($payload['uf_destinatario'] ?? ''))) !== 'SP';
+
+    $payload['natureza_operacao'] = $foraEstado
+        ? 'Outras saídas para fora do estado'
+        : 'Outras saídas para dentro do estado';
+    $cfopBonificacao = $foraEstado ? '6910' : '5910';
+    foreach ($payload['items'] as &$item) {
+        if (is_array($item)) {
+            $item['cfop'] = $cfopBonificacao;
+            $item['icms_situacao_tributaria'] = '50';
+            $item['codigo_beneficio_fiscal'] = 'SP053190';
+        }
+    }
+    unset($item);
+
+    return $payload;
+}
+
+function focusNfeAplicarRevisaoPayloadVenda(array $payload, array $opcoes): array
+{
+    if (($opcoes['local_destino'] ?? null) !== null) {
+        $payload['local_destino'] = (int) $opcoes['local_destino'];
+    }
+    $tipoOperacaoFiscal = (string) ($opcoes['tipo_operacao_fiscal'] ?? 'venda');
+    if (!in_array($tipoOperacaoFiscal, ['venda', 'bonificacao'], true)) {
+        $tipoOperacaoFiscal = 'venda';
+    }
+    $payload['consumidor_final'] = 1;
+    $payload['presenca_comprador'] = 2;
+    $informacoesAdicionais = trim((string) ($opcoes['informacoes_adicionais_contribuinte'] ?? ''));
+    if ($informacoesAdicionais !== '') {
+        $payload['informacoes_adicionais_contribuinte'] = $informacoesAdicionais;
+    }
+
+    $revisao = $opcoes['revisao'] ?? [];
+    $dest = is_array($revisao['destinatario'] ?? null) ? $revisao['destinatario'] : [];
+    $map = [
+        'nome' => 'nome_destinatario',
+        'cpf' => 'cpf_destinatario',
+        'cnpj' => 'cnpj_destinatario',
+        'ie' => 'inscricao_estadual_destinatario',
+        'indicador_ie' => 'indicador_inscricao_estadual_destinatario',
+        'logradouro' => 'logradouro_destinatario',
+        'numero' => 'numero_destinatario',
+        'complemento' => 'complemento_destinatario',
+        'bairro' => 'bairro_destinatario',
+        'municipio' => 'municipio_destinatario',
+        'uf' => 'uf_destinatario',
+        'cep' => 'cep_destinatario',
+        'telefone' => 'telefone_destinatario',
+        'email' => 'email_destinatario',
+    ];
+    foreach ($map as $origem => $campoPayload) {
+        if (array_key_exists($origem, $dest)) {
+            $valor = trim((string) $dest[$origem]);
+            if (in_array($origem, ['cpf', 'cnpj', 'ie', 'cep', 'telefone'], true)) {
+                $valor = focusNfeSomenteDigitos($valor);
+            }
+            if ($origem === 'indicador_ie') {
+                $payload[$campoPayload] = (int) $valor;
+            } elseif ($valor !== '' || in_array($origem, ['complemento', 'email', 'telefone', 'ie'], true)) {
+                $payload[$campoPayload] = $valor;
+            }
+        }
+    }
+    $cpfDestinatario = focusNfeSomenteDigitos((string) ($payload['cpf_destinatario'] ?? ''));
+    $cnpjDestinatario = focusNfeSomenteDigitos((string) ($payload['cnpj_destinatario'] ?? ''));
+    $cpfValido = strlen($cpfDestinatario) === 11;
+    $cnpjValido = strlen($cnpjDestinatario) === 14;
+    unset($payload['cpf_destinatario'], $payload['cnpj_destinatario']);
+    if ($cnpjValido) {
+        $payload['cnpj_destinatario'] = $cnpjDestinatario;
+    } elseif ($cpfValido) {
+        $payload['cpf_destinatario'] = $cpfDestinatario;
+    }
+    $payload = focusNfeSincronizarTransportadorDestinatario($payload);
+
+    $localDestino = (int) ($payload['local_destino'] ?? 0);
+    $ufDestino = strtoupper(trim((string) ($payload['uf_destinatario'] ?? '')));
+    if ($localDestino === 3) {
+        throw new RuntimeException('Operacao com exterior exige dados de pais e identificacao estrangeira antes da emissao.');
+    }
+    if ($localDestino === 1 && $ufDestino !== 'SP') {
+        throw new RuntimeException('Local de destino interno requer destinatario em SP.');
+    }
+    if ($localDestino === 2 && ($ufDestino === '' || $ufDestino === 'SP')) {
+        throw new RuntimeException('Local de destino interestadual requer destinatario fora de SP.');
+    }
+    focusNfeValidarDestinatarioVenda($payload);
+
+    $items = is_array($revisao['items'] ?? null) ? $revisao['items'] : [];
+    $idxExcluir = [];
+    foreach ($payload['items'] as $idx => &$item) {
+        $posted = $items[$idx] ?? null;
+        if (!is_array($posted)) {
+            continue;
+        }
+        // Produto marcado para exclusao no rascunho: remove da NF-e.
+        if (!empty($posted['excluir']) && (string) $posted['excluir'] === '1') {
+            $idxExcluir[] = $idx;
+            continue;
+        }
+        $codigoEsperado = trim((string) ($item['codigo_produto_esperado'] ?? $item['codigo_produto'] ?? ''));
+        $codigoPostado = trim((string) ($posted['codigo_produto'] ?? ''));
+        $codigoEsperadoDigitos = focusNfeSomenteDigitos($codigoEsperado);
+        $codigoPostadoDigitos = focusNfeSomenteDigitos($codigoPostado);
+        if ($codigoEsperadoDigitos !== '' && $codigoPostadoDigitos !== '' && $codigoPostadoDigitos !== $codigoEsperadoDigitos) {
+            $produtoOrigem = trim((string) ($item['produto_nome_origem'] ?? $item['descricao'] ?? ('item ' . ($idx + 1))));
+            throw new RuntimeException(
+                'Codigo divergente na NF-e: ' . $produtoOrigem .
+                ' deve usar o codigo ' . $codigoEsperado .
+                ', mas foi informado ' . $codigoPostado . '.'
+            );
+        }
+        $descricaoEsperada = trim((string) ($item['descricao_esperada'] ?? $item['descricao'] ?? ''));
+        $descricaoPostada = trim((string) ($posted['descricao'] ?? ''));
+        if (
+            $descricaoEsperada !== ''
+            && $descricaoPostada !== ''
+            && focusNfeNormalizarComparacaoItem($descricaoPostada) !== focusNfeNormalizarComparacaoItem($descricaoEsperada)
+        ) {
+            $produtoOrigem = trim((string) ($item['produto_nome_origem'] ?? $item['descricao'] ?? ('item ' . ($idx + 1))));
+            throw new RuntimeException(
+                'Descricao divergente na NF-e: ' . $produtoOrigem .
+                ' deve usar "' . $descricaoEsperada .
+                '", mas foi informado "' . $descricaoPostada . '".'
+            );
+        }
+        foreach (['codigo_produto', 'descricao', 'cfop', 'codigo_ncm', 'unidade_comercial', 'unidade_tributavel', 'icms_situacao_tributaria', 'icms_origem', 'pis_situacao_tributaria', 'cofins_situacao_tributaria', 'codigo_beneficio_fiscal'] as $campo) {
+            if (array_key_exists($campo, $posted)) {
+                $valor = trim((string) $posted[$campo]);
+                if ($campo === 'codigo_ncm') {
+                    $valor = focusNfeSomenteDigitos($valor);
+                }
+                if ($campo === 'codigo_beneficio_fiscal') {
+                    $codigoBeneficio = focusNfeCodigoBeneficioFiscalValido($valor);
+                    if ($codigoBeneficio === null) {
+                        unset($item[$campo]);
+                    } else {
+                        $item[$campo] = $codigoBeneficio;
+                    }
+                } elseif ($valor !== '') {
+                    $item[$campo] = $valor;
+                }
+            }
+        }
+        foreach (['quantidade_comercial', 'valor_unitario_comercial', 'quantidade_tributavel', 'valor_unitario_tributavel', 'valor_bruto'] as $campo) {
+            if (array_key_exists($campo, $posted)) {
+                $item[$campo] = number_format(max(0.0, focusNfeFloat($posted[$campo])), $campo === 'valor_bruto' ? 2 : 4, '.', '');
+            }
+        }
+
+        // Normaliza o item para a SEFAZ aceitar mesmo apos edicao manual:
+        // - tributavel sempre igual ao comercial (quantidade e valor unitario);
+        // - valor_bruto sempre = quantidade_comercial x valor_unitario_comercial (arredondado em 2 casas).
+        $qtdComercial = max(0.0, focusNfeFloat($item['quantidade_comercial'] ?? 0));
+        $vuComercial = max(0.0, focusNfeFloat($item['valor_unitario_comercial'] ?? 0));
+        if ($codigoEsperado !== '') {
+            $item['codigo_produto'] = $codigoEsperado;
+        }
+        if ($descricaoEsperada !== '') {
+            $item['descricao'] = $descricaoEsperada;
+        }
+        $item['quantidade_comercial'] = number_format($qtdComercial, 4, '.', '');
+        $item['valor_unitario_comercial'] = number_format($vuComercial, 4, '.', '');
+        $item['quantidade_tributavel'] = $item['quantidade_comercial'];
+        $item['valor_unitario_tributavel'] = $item['valor_unitario_comercial'];
+        $item['valor_bruto'] = number_format(round($qtdComercial * $vuComercial, 2), 2, '.', '');
+        focusNfeValidarItemFiscalVenda($item, $idx);
+    }
+    unset($item);
+
+    // Remove os itens excluidos no rascunho e renumera sequencialmente (numero_item 1..N).
+    if ($idxExcluir) {
+        foreach ($idxExcluir as $i) {
+            unset($payload['items'][$i]);
+        }
+        $payload['items'] = array_values($payload['items']);
+        $numeroItem = 1;
+        foreach ($payload['items'] as &$itemRenum) {
+            $itemRenum['numero_item'] = (string) $numeroItem++;
+        }
+        unset($itemRenum);
+    }
+    if (empty($payload['items'])) {
+        throw new RuntimeException('Selecione ao menos um produto para emitir a NF-e.');
+    }
+    $payload = focusNfeAplicarTipoOperacaoFiscalVenda($payload, $tipoOperacaoFiscal);
+    foreach ($payload['items'] as $idx => $item) {
+        focusNfeValidarItemFiscalVenda($item, $idx);
+    }
+
+    $pesoLiquidoCalculado = focusNfeCalcularPesoLiquidoItens($payload['items']);
+    if ($pesoLiquidoCalculado <= 0) {
+        throw new RuntimeException('Peso liquido da NF-e precisa ser maior que zero.');
+    }
+    $pesoLiquido = isset($revisao['peso_liquido']) && $revisao['peso_liquido'] !== ''
+        ? max(0.0, focusNfeFloat($revisao['peso_liquido']))
+        : $pesoLiquidoCalculado;
+    if ($pesoLiquido <= 0) {
+        throw new RuntimeException('Peso liquido da NF-e precisa ser maior que zero.');
+    }
+    $pesoBruto = isset($revisao['peso_bruto']) && $revisao['peso_bruto'] !== ''
+        ? max(0.0, focusNfeFloat($revisao['peso_bruto']))
+        : $pesoLiquido + (float) ($opcoes['peso_caixas'] ?? 0);
+    if ($pesoBruto + 0.001 < $pesoLiquido) {
+        throw new RuntimeException('Peso bruto menor que peso liquido na NF-e.');
+    }
+    $payload = focusNfeAplicarVolumes(
+        $payload,
+        $pesoLiquido,
+        $pesoBruto,
+        (int) ($opcoes['quantidade_caixas'] ?? 0),
+        (string) ($opcoes['tipo_caixa_label'] ?? 'VOLUME')
+    );
+
+    return $payload;
+}
+
+function focusNfeDocumentoOperacao(mysqli $conexao, string $ref, array $ids, array $config, array $payload, array $opcoes): int
+{
+    $payload = focusNfeSanitizarCodigoBeneficioFiscal($payload);
+    $payloadJson = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $opcoesJson = json_encode($opcoes, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $revisaoJson = json_encode($opcoes['revisao'] ?? [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $stmt = $conexao->prepare(
+        "INSERT INTO nfe_documentos
+         (ref, tipo_emissao, origem_tipo, origem_id, venda_id, numero_os, cliente_id, fornecedor_id, ambiente, status, payload_json, opcoes_json, revisao_json, peso_liquido, peso_bruto)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'rascunho', ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           tipo_emissao = VALUES(tipo_emissao),
+           origem_tipo = VALUES(origem_tipo),
+           origem_id = VALUES(origem_id),
+           venda_id = VALUES(venda_id),
+           numero_os = VALUES(numero_os),
+           cliente_id = VALUES(cliente_id),
+           fornecedor_id = VALUES(fornecedor_id),
+           payload_json = VALUES(payload_json),
+           opcoes_json = VALUES(opcoes_json),
+           revisao_json = VALUES(revisao_json),
+           peso_liquido = VALUES(peso_liquido),
+           peso_bruto = VALUES(peso_bruto),
+           updated_at = CURRENT_TIMESTAMP"
+    );
+    $tipoEmissao = (string) ($ids['tipo_emissao'] ?? 'venda');
+    $origemTipo = (string) ($ids['origem_tipo'] ?? $tipoEmissao);
+    $origemId = (int) ($ids['origem_id'] ?? 0);
+    $vendaId = isset($ids['venda_id']) ? (int) $ids['venda_id'] : null;
+    $numeroOs = (string) ($ids['numero_os'] ?? '');
+    $clienteId = isset($ids['cliente_id']) ? (int) $ids['cliente_id'] : null;
+    $fornecedorId = isset($ids['fornecedor_id']) ? (int) $ids['fornecedor_id'] : null;
+    $ambiente = (string) $config['ambiente'];
+    $pesoLiquido = isset($payload['peso_liquido']) ? (float) $payload['peso_liquido'] : null;
+    $pesoBruto = isset($payload['peso_bruto']) ? (float) $payload['peso_bruto'] : null;
+    $stmt->bind_param('sssiisiissssdd', $ref, $tipoEmissao, $origemTipo, $origemId, $vendaId, $numeroOs, $clienteId, $fornecedorId, $ambiente, $payloadJson, $opcoesJson, $revisaoJson, $pesoLiquido, $pesoBruto);
+    $stmt->execute();
+    $stmt->close();
+
+    $stmt = $conexao->prepare('SELECT id FROM nfe_documentos WHERE ref = ? AND ambiente = ? LIMIT 1');
+    $stmt->bind_param('ss', $ref, $ambiente);
+    $stmt->execute();
+    $id = (int) ($stmt->get_result()->fetch_assoc()['id'] ?? 0);
+    $stmt->close();
+
+    return $id;
+}
+
+function focusNfeEnviarOperacao(mysqli $conexao, array $config, int $documentoId, string $ref, array $payload): array
+{
+    $payload = focusNfeSanitizarCodigoBeneficioFiscal($payload);
+    $path = '/v2/nfe?ref=' . rawurlencode($ref);
+    $res = focusNfeHttp((string) $config['base_url'], (string) $config['token_ativo'], 'POST', $path, $payload);
+    focusNfeRegistrarTentativa($conexao, $documentoId, $ref, 'emitir', 'POST', $path, $res['http_code'], $payload, $res['raw'], $res['error']);
+    focusNfeAtualizarDocumentoResposta($conexao, $documentoId, $res['http_code'], is_array($res['json']) ? $res['json'] : null, $res['raw']);
+    return [
+        'documento_id' => $documentoId,
+        'ref' => $ref,
+        'http_code' => $res['http_code'],
+        'response' => $res['json'],
+        'raw' => $res['raw'],
+        'error' => $res['error'],
+    ];
+}
+
+function focusNfeEmitirVendaRevisada(mysqli $conexao, ?int $vendaId, ?string $numeroOs, array $opcoes, string $ambiente = 'producao'): array
+{
+    $config = focusNfeLoadConfig($conexao, $ambiente);
+    [$payload, $rows] = focusNfeMontarPayloadVenda($conexao, $config, $vendaId, $numeroOs);
+    $payload = focusNfeAplicarRevisaoPayloadVenda($payload, $opcoes);
+    $payload = focusNfeSanitizarCodigoBeneficioFiscal($payload);
+    $primeira = $rows[0];
+    $vendaIdReal = (int) ($primeira['id'] ?? 0);
+    $numeroOsReal = trim((string) ($primeira['numero_os'] ?? ''));
+
+    $stmt = $conexao->prepare(
+        "SELECT ref, status
+         FROM nfe_documentos
+         WHERE ambiente = ?
+           AND tipo_emissao = 'venda'
+           AND status IN ('enviada', 'processando', 'autorizada')
+           AND ((? <> '' AND numero_os = ?) OR (? > 0 AND venda_id = ?))
+         ORDER BY id DESC
+         LIMIT 1"
+    );
+    $stmt->bind_param('sssii', $ambiente, $numeroOsReal, $numeroOsReal, $vendaIdReal, $vendaIdReal);
+    $stmt->execute();
+    $documentoAtivo = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    if ($documentoAtivo) {
+        throw new RuntimeException(
+            'Ja existe uma NF-e de venda ' . (string) $documentoAtivo['status']
+            . ' para este pedido. Consulte a nota antes de tentar uma nova emissao.'
+        );
+    }
+
+    // A Focus usa a ref como identificador unico. Inclui o conteudo fiscal revisado
+    // para que alteracoes no pedido ou no rascunho nao reutilizem um payload anterior.
+    $payloadRef = $payload;
+    unset($payloadRef['data_emissao'], $payloadRef['data_entrada_saida']);
+    $payloadRefJson = json_encode($payloadRef, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    $ref = focusNfeCriarRef($vendaIdReal, $numeroOsReal)
+        . '-' . substr(hash('sha256', $payloadRefJson !== false ? $payloadRefJson : serialize($payloadRef)), 0, 12);
+
+    $documentoId = focusNfeDocumentoOperacao($conexao, $ref, [
+        'tipo_emissao' => 'venda',
+        'origem_tipo' => 'venda',
+        'origem_id' => $vendaIdReal,
+        'venda_id' => $vendaIdReal,
+        'numero_os' => $numeroOsReal,
+        'cliente_id' => (int) ($primeira['cliente_id'] ?? 0),
+    ], $config, $payload, $opcoes);
+
+    return focusNfeEnviarOperacao($conexao, $config, $documentoId, $ref, $payload);
+}
+
+function focusNfeFornecedorEndereco(array $row): array
+{
+    return [
+        'logradouro' => (string) ($row['nfe_endereco'] ?: ''),
+        'numero' => (string) ($row['nfe_numero'] ?: 'S/N'),
+        'complemento' => (string) ($row['nfe_complemento'] ?? ''),
+        'bairro' => (string) ($row['nfe_bairro'] ?: ''),
+        'municipio' => (string) ($row['nfe_cidade'] ?: ''),
+        'uf' => strtoupper((string) ($row['nfe_estado'] ?: 'SP')),
+        'cep' => focusNfeSomenteDigitos((string) ($row['nfe_cep'] ?: '')),
+    ];
+}
+
+function focusNfeBuscarCompra(mysqli $conexao, string $numeroOs): array
+{
+    $stmt = $conexao->prepare(
+        "SELECT e.*, p.nome AS produto_nome, p.codigo_barras AS produto_codigo_barras, p.codigo_interno AS produto_codigo_interno,
+                p.unidade AS produto_unidade, p.ncm AS produto_ncm, p.nfe_ncm AS produto_nfe_ncm, p.nfe_descricao AS produto_nfe_descricao,
+                p.nfe_tipo AS produto_nfe_tipo, p.nfe_origem AS produto_nfe_origem, p.preco_custo,
+                f.nome AS fornecedor_nome, f.cnpj AS fornecedor_documento, f.telefone AS fornecedor_telefone,
+                f.nfe_nome_razao_social, f.nfe_cpf, f.nfe_cnpj, f.nfe_ie, f.nfe_indicador_ie_destinatario,
+                f.nfe_telefone, f.nfe_email, f.nfe_endereco, f.nfe_numero, f.nfe_complemento, f.nfe_bairro,
+                f.nfe_cidade, f.nfe_estado, f.nfe_cep
+         FROM entradas e
+         LEFT JOIN produtos p ON p.id = e.produto_id
+         LEFT JOIN fornecedores f ON f.id = e.fornecedor_id
+         WHERE e.numero_os = ? AND e.tipo = 'entrada_fornecedor'
+         ORDER BY e.id ASC"
+    );
+    $stmt->bind_param('s', $numeroOs);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+    if (!$rows) {
+        throw new RuntimeException('Compra concluida nao encontrada.');
+    }
+    return $rows;
+}
+
+function focusNfeBuscarChaveCompraReferenciada(mysqli $conexao, string $numeroOs, string $ambiente): string
+{
+    $stmt = $conexao->prepare("
+        SELECT chave_nfe
+        FROM nfe_documentos
+        WHERE numero_os = ?
+          AND ambiente = ?
+          AND tipo_emissao = 'compra'
+          AND status = 'autorizada'
+          AND chave_nfe IS NOT NULL
+          AND chave_nfe <> ''
+        ORDER BY autorizada_em DESC, updated_at DESC, id DESC
+        LIMIT 1
+    ");
+    $stmt->bind_param('ss', $numeroOs, $ambiente);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    $chave = focusNfeSomenteDigitos((string) ($row['chave_nfe'] ?? ''));
+    if (strlen($chave) !== 44) {
+        throw new RuntimeException('Para emitir devolucao, emita e autorize primeiro a NF-e de compra da mesma OS.');
+    }
+
+    return $chave;
+}
+
+function focusNfeMontarPayloadCompra(mysqli $conexao, array $config, string $numeroOs, string $tipoEmissao, ?int $localDestino = null): array
+{
+    $rows = focusNfeBuscarCompra($conexao, $numeroOs);
+    $snapshot = pedidoCompraObterSnapshot($conexao, $numeroOs, '', false);
+    $primeira = $rows[0];
+    $end = focusNfeFornecedorEndereco($primeira);
+    $cpf = focusNfeSomenteDigitos($primeira['nfe_cpf'] ?: $primeira['fornecedor_documento'] ?? '');
+    $cnpj = focusNfeSomenteDigitos($primeira['nfe_cnpj'] ?: $primeira['fornecedor_documento'] ?? '');
+    if (strlen($cpf) !== 11) $cpf = '';
+    if (strlen($cnpj) !== 14) $cnpj = '';
+    if ($cpf === '' && $cnpj === '') {
+        throw new RuntimeException('Fornecedor sem CPF/CNPJ valido para NF-e.');
+    }
+
+    $isDevolucao = $tipoEmissao === 'devolucao_compra';
+    // Saida de abate sem nota de entrada: sai do estoque (saida), sem nota referenciada e como nota normal (codigo unico).
+    $isSaidaAbate = $tipoEmissao === 'saida_abate_sem_entrada';
+    // Ambas saem do estoque (documento de saida) e usam a quantidade abatida (descarte).
+    $isSaida = $isDevolucao || $isSaidaAbate;
+
+    // Regra: apenas UMA devolucao/saida de abate autorizada por OS.
+    if ($isSaida) {
+        $stmtDev = $conexao->prepare(
+            "SELECT COUNT(*) AS total FROM nfe_documentos
+             WHERE numero_os = ? AND ambiente = ?
+               AND tipo_emissao IN ('devolucao_compra', 'saida_abate_sem_entrada')
+               AND status = 'autorizada'"
+        );
+        $ambienteCfg = (string) ($config['ambiente'] ?? '');
+        $stmtDev->bind_param('ss', $numeroOs, $ambienteCfg);
+        $stmtDev->execute();
+        $totalDev = (int) ($stmtDev->get_result()->fetch_assoc()['total'] ?? 0);
+        $stmtDev->close();
+        if ($totalDev > 0) {
+            throw new RuntimeException('Ja existe uma devolucao autorizada para esta OS. E permitida apenas uma devolucao por OS.');
+        }
+    }
+
+    $localDestinoPadrao = $end['uf'] === 'SP' ? 1 : 2;
+    $localDestino = $localDestino ?? $localDestinoPadrao;
+    if (!in_array($localDestino, [1, 2, 3], true)) {
+        throw new RuntimeException('Local de destino invalido para NF-e.');
+    }
+    if ($localDestino === 3) {
+        throw new RuntimeException('Operacao com exterior exige dados de pais e identificacao estrangeira antes da emissao.');
+    }
+    if ($localDestino === 1 && $end['uf'] !== 'SP') {
+        throw new RuntimeException('Local de destino interno requer fornecedor em SP.');
+    }
+    if ($localDestino === 2 && ($end['uf'] === '' || $end['uf'] === 'SP')) {
+        throw new RuntimeException('Local de destino interestadual requer fornecedor fora de SP.');
+    }
+    $indicadorIeDestinatario = focusNfeIndicadorIe($primeira['nfe_indicador_ie_destinatario'] ?? '', $primeira['nfe_ie'] ?? '');
+    $consumidorFinal = $isSaida && $indicadorIeDestinatario === 9 ? 1 : 0;
+    $payload = [
+        // Devolucao e saida de abate usam natureza de devolucao; entrada normal = compra.
+        'natureza_operacao' => $isSaida ? 'Devolucao de compra' : 'Compra de mercadoria',
+        'data_emissao' => date('c'),
+        // Saida (devolucao ou abate) = documento de saida; entrada = 0.
+        'tipo_documento' => $isSaida ? 1 : 0,
+        // Devolucao com referencia = finalidade 4; saida de abate sem entrada = nota normal (1).
+        'finalidade_emissao' => $isDevolucao ? 4 : 1,
+        'local_destino' => $localDestino,
+        'consumidor_final' => $consumidorFinal,
+        'presenca_comprador' => 2,
+        'cnpj_emitente' => focusNfeSomenteDigitos($config['cnpj_emitente'] ?? ''),
+        'nome_emitente' => (string) ($config['nome_emitente'] ?? ''),
+        'inscricao_estadual_emitente' => focusNfeSomenteDigitos($config['inscricao_estadual_emitente'] ?? ''),
+        'regime_tributario_emitente' => $config['regime_tributario_emitente'] !== null ? (int) $config['regime_tributario_emitente'] : null,
+        'nome_destinatario' => (string) ($primeira['nfe_nome_razao_social'] ?: $primeira['fornecedor_nome'] ?: 'NAO INFORMADO'),
+        'logradouro_destinatario' => $end['logradouro'] ?: 'NAO INFORMADO',
+        'numero_destinatario' => $end['numero'] ?: 'S/N',
+        'complemento_destinatario' => $end['complemento'],
+        'bairro_destinatario' => $end['bairro'] ?: 'NAO INFORMADO',
+        'municipio_destinatario' => $end['municipio'],
+        'uf_destinatario' => $end['uf'],
+        'cep_destinatario' => $end['cep'],
+        'telefone_destinatario' => focusNfeSomenteDigitos($primeira['nfe_telefone'] ?: $primeira['fornecedor_telefone'] ?? ''),
+        'email_destinatario' => (string) ($primeira['nfe_email'] ?? ''),
+        'inscricao_estadual_destinatario' => focusNfeSomenteDigitos($primeira['nfe_ie'] ?? ''),
+        'indicador_inscricao_estadual_destinatario' => $indicadorIeDestinatario,
+        'modalidade_frete' => (int) $config['modalidade_frete_padrao'],
+        'items' => [],
+    ];
+    if ($cpf !== '') $payload['cpf_destinatario'] = $cpf; else $payload['cnpj_destinatario'] = $cnpj;
+    if ($isDevolucao) {
+        $payload['notas_referenciadas'] = [[
+            'chave_nfe' => focusNfeBuscarChaveCompraReferenciada($conexao, $numeroOs, (string) $config['ambiente']),
+        ]];
+    }
+
+    $snapshotItensPorProduto = [];
+    foreach (($snapshot['itens'] ?? []) as $item) {
+        $chaveProduto = focusNfeNormalizarTexto((string) ($item['produto'] ?? ''));
+        if ($chaveProduto === '') {
+            continue;
+        }
+        $snapshotItensPorProduto[$chaveProduto][] = $item;
+    }
+    $snapshotItensUsados = [];
+
+    $numeroItem = 1;
+    foreach ($rows as $row) {
+        focusNfeValidarVinculoProduto($row, 'compra');
+        $chaveProduto = focusNfeNormalizarTexto((string) ($row['produto_nome'] ?? ''));
+        $indiceSnapshot = $snapshotItensUsados[$chaveProduto] ?? 0;
+        $snap = $snapshotItensPorProduto[$chaveProduto][$indiceSnapshot] ?? [];
+        $snapshotItensUsados[$chaveProduto] = $indiceSnapshot + 1;
+        $quantidadeBase = (float) ($row['quantidade'] ?? 0);
+        // A entrada fiscal espelha o pedido original; o estoque permanece com a quantidade realmente recebida.
+        $quantidadePedido = (float) ($snap['quantidade'] ?? 0);
+        $quantidade = $isSaida
+            ? (float) ($snap['descarte'] ?? 0)
+            : ($quantidadePedido > 0 ? $quantidadePedido : $quantidadeBase);
+        if ($isSaida && $quantidade <= 0) {
+            continue;
+        }
+        $ncm = focusNfeNcmProduto($row);
+        if (strlen($ncm) !== 8) {
+            throw new RuntimeException(
+                'Produto "' . (string) $row['produto_nome']
+                . '" (produto_id ' . (int) $row['produto_id']
+                . ') sem NCM valido com 8 digitos.'
+            );
+        }
+        $precoUnitario = (float) ($snap['preco_unitario'] ?? $row['preco_custo'] ?? 0);
+        if ($precoUnitario <= 0) {
+            $precoUnitario = 0.01;
+        }
+        $valorTotal = $quantidade * $precoUnitario;
+        $unidade = focusNfeUnidade((string) ($row['produto_unidade'] ?? 'KG'));
+        $operacao = focusNfeOperacaoManual($tipoEmissao, $end['uf']);
+        $codigoProduto = trim((string) ($row['produto_codigo_interno'] ?: $row['produto_codigo_barras'] ?: $row['produto_id']));
+        $payload['items'][] = [
+            'numero_item' => (string) $numeroItem++,
+            'codigo_produto' => $codigoProduto !== '' ? $codigoProduto : (string) $row['produto_id'],
+            'descricao' => focusNfeDescricaoCompraSemGramagem((string) ($row['produto_nfe_descricao'] ?: $row['produto_nome'] ?: 'PRODUTO')),
+            'cfop' => $operacao['cfop'],
+            'unidade_comercial' => $unidade,
+            'quantidade_comercial' => number_format($quantidade, 4, '.', ''),
+            'valor_unitario_comercial' => number_format($precoUnitario, 4, '.', ''),
+            'unidade_tributavel' => $unidade,
+            'quantidade_tributavel' => number_format($quantidade, 4, '.', ''),
+            'valor_unitario_tributavel' => number_format($precoUnitario, 4, '.', ''),
+            'codigo_ncm' => $ncm,
+            'valor_bruto' => number_format($valorTotal, 2, '.', ''),
+            'icms_situacao_tributaria' => '40',
+            'icms_origem' => '0',
+            'codigo_beneficio_fiscal' => 'SP010360',
+            'pis_situacao_tributaria' => '70',
+            'cofins_situacao_tributaria' => '70',
+        ];
+    }
+    if (!$payload['items']) {
+        throw new RuntimeException($isSaida ? 'Compra sem quantidade abatida para devolucao/saida.' : 'Compra sem itens para NF-e.');
+    }
+    $peso = array_sum(array_map(static fn($item) => focusNfeFloat($item['quantidade_comercial'] ?? 0), $payload['items']));
+    $payload = focusNfeAplicarVolumes($payload, $peso, $peso, 1, 'VOLUME');
+    return [$payload, $rows];
+}
+
+function focusNfeOpcoesCompraFromPost(array $post): array
+{
+    $localDestino = focusNfeLocalDestinoFromPost($post);
+    $informacoesAdicionais = focusNfeInformacoesAdicionaisFromPost($post);
+
+    return [
+        'local_destino' => $localDestino,
+        'informacoes_adicionais_contribuinte' => $informacoesAdicionais,
+        'revisao' => [
+            'destinatario' => is_array($post['destinatario'] ?? null) ? $post['destinatario'] : [],
+            'items' => is_array($post['items'] ?? null) ? $post['items'] : [],
+        ],
+    ];
+}
+
+function focusNfeAplicarRevisaoPayloadCompra(array $payload, array $opcoes): array
+{
+    if (($opcoes['local_destino'] ?? null) !== null) {
+        $payload['local_destino'] = (int) $opcoes['local_destino'];
+    }
+    $informacoesAdicionais = trim((string) ($opcoes['informacoes_adicionais_contribuinte'] ?? ''));
+    if ($informacoesAdicionais !== '') {
+        $payload['informacoes_adicionais_contribuinte'] = $informacoesAdicionais;
+    }
+
+    $revisao = $opcoes['revisao'] ?? [];
+    $dest = is_array($revisao['destinatario'] ?? null) ? $revisao['destinatario'] : [];
+    $map = [
+        'nome' => 'nome_destinatario',
+        'cpf' => 'cpf_destinatario',
+        'cnpj' => 'cnpj_destinatario',
+        'ie' => 'inscricao_estadual_destinatario',
+        'indicador_ie' => 'indicador_inscricao_estadual_destinatario',
+        'logradouro' => 'logradouro_destinatario',
+        'numero' => 'numero_destinatario',
+        'complemento' => 'complemento_destinatario',
+        'bairro' => 'bairro_destinatario',
+        'municipio' => 'municipio_destinatario',
+        'uf' => 'uf_destinatario',
+        'cep' => 'cep_destinatario',
+        'telefone' => 'telefone_destinatario',
+        'email' => 'email_destinatario',
+    ];
+    foreach ($map as $origem => $campoPayload) {
+        if (array_key_exists($origem, $dest)) {
+            $valor = trim((string) $dest[$origem]);
+            if (in_array($origem, ['cpf', 'cnpj', 'ie', 'cep', 'telefone'], true)) {
+                $valor = focusNfeSomenteDigitos($valor);
+            }
+            if ($origem === 'indicador_ie') {
+                $payload[$campoPayload] = (int) $valor;
+            } elseif ($valor !== '' || in_array($origem, ['complemento', 'email', 'telefone', 'ie'], true)) {
+                $payload[$campoPayload] = $valor;
+            }
+        }
+    }
+    $cpfDestinatario = focusNfeSomenteDigitos((string) ($payload['cpf_destinatario'] ?? ''));
+    $cnpjDestinatario = focusNfeSomenteDigitos((string) ($payload['cnpj_destinatario'] ?? ''));
+    $cpfValido = strlen($cpfDestinatario) === 11;
+    $cnpjValido = strlen($cnpjDestinatario) === 14;
+    unset($payload['cpf_destinatario'], $payload['cnpj_destinatario']);
+    if ($cnpjValido) {
+        $payload['cnpj_destinatario'] = $cnpjDestinatario;
+    } elseif ($cpfValido) {
+        $payload['cpf_destinatario'] = $cpfDestinatario;
+    }
+    $localDestino = (int) ($payload['local_destino'] ?? 0);
+    $ufDestino = strtoupper(trim((string) ($payload['uf_destinatario'] ?? '')));
+    if ($localDestino === 3) {
+        throw new RuntimeException('Operacao com exterior exige dados de pais e identificacao estrangeira antes da emissao.');
+    }
+    if ($localDestino === 1 && $ufDestino !== 'SP') {
+        throw new RuntimeException('Local de destino interno requer fornecedor em SP.');
+    }
+    if ($localDestino === 2 && ($ufDestino === '' || $ufDestino === 'SP')) {
+        throw new RuntimeException('Local de destino interestadual requer fornecedor fora de SP.');
+    }
+
+    $items = is_array($revisao['items'] ?? null) ? $revisao['items'] : [];
+    $idxExcluir = [];
+    foreach ($payload['items'] as $idx => &$item) {
+        $posted = $items[$idx] ?? null;
+        if (!is_array($posted)) {
+            continue;
+        }
+        if (!empty($posted['excluir']) && (string) $posted['excluir'] === '1') {
+            $idxExcluir[] = $idx;
+            continue;
+        }
+        foreach (['codigo_produto', 'descricao', 'cfop', 'codigo_ncm', 'unidade_comercial', 'unidade_tributavel', 'icms_situacao_tributaria', 'icms_origem', 'pis_situacao_tributaria', 'cofins_situacao_tributaria', 'codigo_beneficio_fiscal'] as $campo) {
+            if (array_key_exists($campo, $posted)) {
+                $valor = trim((string) $posted[$campo]);
+                if ($campo === 'codigo_ncm') {
+                    $valor = focusNfeSomenteDigitos($valor);
+                }
+                if ($campo === 'codigo_beneficio_fiscal') {
+                    $codigoBeneficio = focusNfeCodigoBeneficioFiscalValido($valor);
+                    if ($codigoBeneficio === null) {
+                        unset($item[$campo]);
+                    } else {
+                        $item[$campo] = $codigoBeneficio;
+                    }
+                } elseif ($valor !== '') {
+                    $item[$campo] = $valor;
+                }
+            }
+        }
+        foreach (['quantidade_comercial', 'valor_unitario_comercial', 'quantidade_tributavel', 'valor_unitario_tributavel', 'valor_bruto'] as $campo) {
+            if (array_key_exists($campo, $posted)) {
+                $item[$campo] = number_format(max(0.0, focusNfeFloat($posted[$campo])), $campo === 'valor_bruto' ? 2 : 4, '.', '');
+            }
+        }
+        $qtdComercial = max(0.0, focusNfeFloat($item['quantidade_comercial'] ?? 0));
+        $vuComercial = max(0.0, focusNfeFloat($item['valor_unitario_comercial'] ?? 0));
+        $item['quantidade_comercial'] = number_format($qtdComercial, 4, '.', '');
+        $item['valor_unitario_comercial'] = number_format($vuComercial, 4, '.', '');
+        $item['quantidade_tributavel'] = $item['quantidade_comercial'];
+        $item['valor_unitario_tributavel'] = $item['valor_unitario_comercial'];
+        $item['valor_bruto'] = number_format(round($qtdComercial * $vuComercial, 2), 2, '.', '');
+    }
+    unset($item);
+
+    if ($idxExcluir) {
+        foreach ($idxExcluir as $i) {
+            unset($payload['items'][$i]);
+        }
+        $payload['items'] = array_values($payload['items']);
+        $numeroItem = 1;
+        foreach ($payload['items'] as &$itemRenum) {
+            $itemRenum['numero_item'] = (string) $numeroItem++;
+        }
+        unset($itemRenum);
+    }
+    if (empty($payload['items'])) {
+        throw new RuntimeException('Selecione ao menos um produto para emitir a NF-e.');
+    }
+
+    $peso = 0.0;
+    foreach ($payload['items'] as $itPeso) {
+        $peso += focusNfeFloat($itPeso['quantidade_comercial'] ?? 0);
+    }
+    $payload = focusNfeAplicarVolumes($payload, $peso, $peso, 1, 'VOLUME');
+
+    return $payload;
+}
+
+function focusNfeEmitirCompraRevisada(mysqli $conexao, string $numeroOs, string $tipoEmissao, array $opcoes, string $ambiente = 'producao'): array
+{
+    if (!in_array($tipoEmissao, ['compra', 'devolucao_compra', 'saida_abate_sem_entrada'], true)) {
+        $tipoEmissao = 'compra';
+    }
+    $config = focusNfeLoadConfig($conexao, $ambiente);
+    $localDestino = isset($opcoes['local_destino']) && $opcoes['local_destino'] !== null ? (int) $opcoes['local_destino'] : null;
+    [$payload, $rows] = focusNfeMontarPayloadCompra($conexao, $config, $numeroOs, $tipoEmissao, $localDestino);
+    $payload = focusNfeAplicarRevisaoPayloadCompra($payload, $opcoes);
+
+    $prefixo = $tipoEmissao === 'devolucao_compra'
+        ? 'DEV-COMPRA-OS-'
+        : ($tipoEmissao === 'saida_abate_sem_entrada' ? 'SAIDA-ABATE-OS-' : 'COMPRA-OS-');
+    $ref = $prefixo . preg_replace('/[^A-Za-z0-9_-]/', '-', trim($numeroOs));
+    $primeira = $rows[0];
+    $documentoId = focusNfeDocumentoOperacao($conexao, $ref, [
+        'tipo_emissao' => $tipoEmissao,
+        'origem_tipo' => 'compra',
+        'origem_id' => (int) ($primeira['id'] ?? 0),
+        'numero_os' => $numeroOs,
+        'fornecedor_id' => (int) ($primeira['fornecedor_id'] ?? 0),
+    ], $config, $payload, $opcoes);
+
+    return focusNfeEnviarOperacao($conexao, $config, $documentoId, $ref, $payload);
+}
+
+function focusNfeEmitirCompraOperacao(mysqli $conexao, string $numeroOs, string $tipoEmissao, string $ambiente = 'producao', ?int $localDestino = null, string $informacoesAdicionais = ''): array
+{
+    $config = focusNfeLoadConfig($conexao, $ambiente);
+    [$payload, $rows] = focusNfeMontarPayloadCompra($conexao, $config, $numeroOs, $tipoEmissao, $localDestino);
+    $informacoesAdicionais = trim($informacoesAdicionais);
+    if ($informacoesAdicionais !== '') {
+        $payload['informacoes_adicionais_contribuinte'] = $informacoesAdicionais;
+    }
+    $prefixo = $tipoEmissao === 'devolucao_compra'
+        ? 'DEV-COMPRA-OS-'
+        : ($tipoEmissao === 'saida_abate_sem_entrada' ? 'SAIDA-ABATE-OS-' : 'COMPRA-OS-');
+    $ref = $prefixo . preg_replace('/[^A-Za-z0-9_-]/', '-', trim($numeroOs));
+    $primeira = $rows[0];
+    $documentoId = focusNfeDocumentoOperacao($conexao, $ref, [
+        'tipo_emissao' => $tipoEmissao,
+        'origem_tipo' => 'compra',
+        'origem_id' => (int) ($primeira['id'] ?? 0),
+        'numero_os' => $numeroOs,
+        'fornecedor_id' => (int) ($primeira['fornecedor_id'] ?? 0),
+    ], $config, $payload, ['local_destino' => $localDestino, 'informacoes_adicionais_contribuinte' => $informacoesAdicionais, 'revisao' => []]);
+
+    return focusNfeEnviarOperacao($conexao, $config, $documentoId, $ref, $payload);
+}

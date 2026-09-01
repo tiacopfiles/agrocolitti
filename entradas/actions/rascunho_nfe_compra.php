@@ -1,0 +1,231 @@
+<?php
+require __DIR__ . '/../../config/conexao.php';
+require __DIR__ . '/../../auth/proteger.php';
+require __DIR__ . '/../../config/permissions.php';
+require __DIR__ . '/../../focus/focus_nfe_operacoes.php';
+
+header('Content-Type: application/json; charset=utf-8');
+
+if (!userCanAccess('exportar_nfe')) {
+    http_response_code(403);
+    echo json_encode(['ok' => false, 'erro' => 'Sem permissao para emitir NF-e.']);
+    exit;
+}
+
+function nfeCompraBuscarRascunho(mysqli $conexao, string $ambiente, string $tipo, string $numeroOs): ?array
+{
+    $stmt = $conexao->prepare("
+        SELECT id, ref, opcoes_json, revisao_json, updated_at
+        FROM nfe_documentos
+        WHERE ambiente = ?
+          AND tipo_emissao = ?
+          AND numero_os = ?
+          AND status = 'rascunho'
+          AND ref LIKE 'RASC-%'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+    ");
+    $stmt->bind_param('sss', $ambiente, $tipo, $numeroOs);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc() ?: null;
+    $stmt->close();
+    return $row;
+}
+
+function nfeCompraOpcoesRascunho(?array $rascunho): array
+{
+    if (!$rascunho) {
+        return [];
+    }
+    $opcoes = json_decode((string) ($rascunho['opcoes_json'] ?? ''), true);
+    if (!is_array($opcoes)) {
+        $opcoes = [];
+    }
+    if (!isset($opcoes['revisao']) || !is_array($opcoes['revisao'])) {
+        $revisao = json_decode((string) ($rascunho['revisao_json'] ?? ''), true);
+        if (is_array($revisao)) {
+            $opcoes['revisao'] = $revisao;
+        }
+    }
+    return $opcoes;
+}
+
+function nfeCompraRespostaRascunho(
+    array $payload,
+    array $payloadCalculado,
+    array $financeiro,
+    array $opcoes,
+    string $numeroOs,
+    string $tipo,
+    ?array $rascunho = null
+): array {
+    $revisao = is_array($opcoes['revisao'] ?? null) ? $opcoes['revisao'] : [];
+    $destRevisao = is_array($revisao['destinatario'] ?? null) ? $revisao['destinatario'] : [];
+    $itemsRevisao = is_array($revisao['items'] ?? null) ? $revisao['items'] : [];
+    $destinatario = [
+        'nome' => $payload['nome_destinatario'] ?? '',
+        'cpf' => $payload['cpf_destinatario'] ?? '',
+        'cnpj' => $payload['cnpj_destinatario'] ?? '',
+        'ie' => $payload['inscricao_estadual_destinatario'] ?? '',
+        'indicador_ie' => $payload['indicador_inscricao_estadual_destinatario'] ?? '',
+        'logradouro' => $payload['logradouro_destinatario'] ?? '',
+        'numero' => $payload['numero_destinatario'] ?? '',
+        'complemento' => $payload['complemento_destinatario'] ?? '',
+        'bairro' => $payload['bairro_destinatario'] ?? '',
+        'municipio' => $payload['municipio_destinatario'] ?? '',
+        'uf' => $payload['uf_destinatario'] ?? '',
+        'cep' => $payload['cep_destinatario'] ?? '',
+        'telefone' => $payload['telefone_destinatario'] ?? '',
+        'email' => $payload['email_destinatario'] ?? '',
+    ];
+    foreach ($destinatario as $campo => $valor) {
+        if (array_key_exists($campo, $destRevisao)) {
+            $destinatario[$campo] = (string) $destRevisao[$campo];
+        }
+    }
+
+    $items = [];
+    foreach (array_values($payload['items'] ?? []) as $idx => $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+        $itemRevisao = is_array($itemsRevisao[$idx] ?? null) ? $itemsRevisao[$idx] : [];
+        foreach ($itemRevisao as $campo => $valor) {
+            if ($campo !== 'excluir') {
+                $item[$campo] = $campo === 'codigo_beneficio_fiscal'
+                    ? (focusNfeCodigoBeneficioFiscalValido($valor) ?? 'SP010360')
+                    : $valor;
+            }
+        }
+        if (!array_key_exists('codigo_beneficio_fiscal', $item)) {
+            $item['codigo_beneficio_fiscal'] = 'SP010360';
+        }
+        $item['excluir'] = (string) ($itemRevisao['excluir'] ?? '0');
+        $items[] = $item;
+    }
+
+    return [
+        'ok' => true,
+        'rascunho_carregado' => $rascunho !== null,
+        'rascunho_ref' => (string) ($rascunho['ref'] ?? ''),
+        'rascunho_updated_at' => (string) ($rascunho['updated_at'] ?? ''),
+        'numero_os' => $numeroOs,
+        'tipo_emissao' => $tipo,
+        'geral' => [
+            'natureza_operacao' => $payload['natureza_operacao'] ?? '',
+            'local_destino' => $opcoes['local_destino'] ?? $payload['local_destino'] ?? 1,
+            'tipo_documento' => $payload['tipo_documento'] ?? 0,
+            'finalidade_emissao' => $payload['finalidade_emissao'] ?? 1,
+            'consumidor_final' => $payload['consumidor_final'] ?? 0,
+        ],
+        'destinatario' => $destinatario,
+        'items' => $items,
+        'valores' => [
+            'valor_itens' => round(array_sum(array_map(static fn($item): float => focusNfeFloat($item['valor_bruto'] ?? 0), (array) ($payloadCalculado['items'] ?? []))), 2),
+            'outras_despesas' => round(focusNfeFloat($payloadCalculado['valor_outras_despesas'] ?? 0), 2),
+            'valor_total_estimado' => round(
+                array_sum(array_map(static fn($item): float => focusNfeFloat($item['valor_bruto'] ?? 0), (array) ($payloadCalculado['items'] ?? [])))
+                + focusNfeFloat($payloadCalculado['valor_outras_despesas'] ?? 0),
+                2
+            ),
+            'valor_itens_origem' => round((float) ($financeiro['valor_itens_origem'] ?? 0), 2),
+            'outras_despesas_origem' => round((float) ($financeiro['outras_despesas_origem'] ?? 0), 2),
+        ],
+        'informacoes_adicionais_contribuinte' => (string) (
+            $opcoes['informacoes_adicionais_contribuinte']
+            ?? $payload['informacoes_adicionais_contribuinte']
+            ?? ''
+        ),
+        'chave_nfe_referenciada' => (string) (
+            $opcoes['chave_nfe_referenciada']
+            ?? ($payloadCalculado['notas_referenciadas'][0]['chave_nfe'] ?? '')
+        ),
+    ];
+}
+
+$acao = strtolower(trim((string) ($_POST['_acao'] ?? $_GET['_acao'] ?? 'carregar')));
+$ignorarRascunho = (string) ($_POST['_ignorar_rascunho'] ?? $_GET['_ignorar_rascunho'] ?? '0') === '1';
+$numeroOs = trim((string) ($_POST['numero_os'] ?? $_GET['numero_os'] ?? ''));
+$tipo = trim((string) ($_POST['tipo_emissao'] ?? $_GET['tipo_emissao'] ?? 'compra'));
+$ambiente = (string) ($_POST['ambiente'] ?? $_GET['ambiente'] ?? 'producao');
+if (!in_array($tipo, ['compra', 'devolucao_compra', 'saida_abate_sem_entrada'], true)) {
+    $tipo = 'compra';
+}
+$localDestino = null;
+if (isset($_POST['local_destino']) && $_POST['local_destino'] !== '') {
+    $localDestino = (int) $_POST['local_destino'];
+} elseif (isset($_GET['local_destino']) && $_GET['local_destino'] !== '') {
+    $localDestino = (int) $_GET['local_destino'];
+}
+
+try {
+    if ($numeroOs === '') {
+        throw new RuntimeException('Informe a OS da compra.');
+    }
+    $config = focusNfeLoadConfig($conexao, $ambiente);
+    [$payload, $rows, $financeiro] = focusNfeMontarPayloadCompra($conexao, $config, $numeroOs, $tipo, $localDestino);
+
+    if ($acao === 'salvar') {
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            throw new RuntimeException('Metodo invalido para salvar rascunho.');
+        }
+        validarTokenCsrf();
+        $opcoes = focusNfeOpcoesCompraFromPost($_POST);
+        $payloadRevisado = focusNfeAplicarRevisaoPayloadCompra($payload, $opcoes);
+        $payloadCalculado = in_array($tipo, ['devolucao_compra', 'saida_abate_sem_entrada'], true)
+            ? focusNfeRemoverCustosAcessoriosDevolucao($payloadRevisado)
+            : focusNfeAplicarOutrasDespesasCompra($payloadRevisado, $financeiro);
+        $prefixos = [
+            'compra' => 'RASC-COMPRA-OS-',
+            'devolucao_compra' => 'RASC-DEV-COMPRA-OS-',
+            'saida_abate_sem_entrada' => 'RASC-SAIDA-ABATE-OS-',
+        ];
+        $osRef = substr(preg_replace('/[^A-Za-z0-9_-]/', '-', $numeroOs), 0, 45);
+        $ref = $prefixos[$tipo] . $osRef;
+        $primeira = $rows[0] ?? [];
+        $documentoId = focusNfeDocumentoOperacao($conexao, $ref, [
+            'tipo_emissao' => $tipo,
+            'origem_tipo' => 'compra',
+            'origem_id' => (int) ($primeira['id'] ?? 0),
+            'numero_os' => $numeroOs,
+            'fornecedor_id' => (int) ($primeira['fornecedor_id'] ?? 0),
+        ], $config, $payloadCalculado, $opcoes);
+        $rascunho = nfeCompraBuscarRascunho($conexao, (string) $config['ambiente'], $tipo, $numeroOs);
+        if (!$rascunho || (int) ($rascunho['id'] ?? 0) !== $documentoId) {
+            throw new RuntimeException('O rascunho foi gravado, mas nao foi possivel confirma-lo no banco de dados.');
+        }
+        $resposta = nfeCompraRespostaRascunho(
+            $payload,
+            $payloadCalculado,
+            $financeiro,
+            nfeCompraOpcoesRascunho($rascunho),
+            $numeroOs,
+            $tipo,
+            $rascunho
+        );
+        $resposta += [
+            'documento_id' => $documentoId,
+            'ref' => $ref,
+            'mensagem' => 'Rascunho da NF-e salvo.',
+        ];
+        echo json_encode($resposta, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    $rascunho = $ignorarRascunho
+        ? null
+        : nfeCompraBuscarRascunho($conexao, (string) $config['ambiente'], $tipo, $numeroOs);
+    $opcoes = nfeCompraOpcoesRascunho($rascunho);
+    $payloadRevisado = focusNfeAplicarRevisaoPayloadCompra($payload, $opcoes);
+    $payloadCalculado = in_array($tipo, ['devolucao_compra', 'saida_abate_sem_entrada'], true)
+        ? focusNfeRemoverCustosAcessoriosDevolucao($payloadRevisado)
+        : focusNfeAplicarOutrasDespesasCompra($payloadRevisado, $financeiro);
+    echo json_encode(
+        nfeCompraRespostaRascunho($payload, $payloadCalculado, $financeiro, $opcoes, $numeroOs, $tipo, $rascunho),
+        JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+    );
+    exit;
+} catch (Throwable $e) {
+    echo json_encode(['ok' => false, 'erro' => $e->getMessage()]);
+    exit;
+}

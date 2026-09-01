@@ -1,0 +1,651 @@
+<?php
+require '../config/conexao.php';
+require '../auth/proteger.php';
+
+// --- NCM por palavra-chave (normalizado, ordem: mais longo primeiro) ---
+$ncmKeywordMap = [
+    'banana da terra'  => '08031010',
+    'batata doce'      => '07142000',
+    'batata ingles'    => '07019000',
+    'batata yacon'     => '07149090',
+    'batata salm'      => '07142000',
+    'limao tahiti'     => '08055010',
+    'limao sicilian'   => '08055090',
+    'limao rosa'       => '08055090',
+    'tomate'           => '07020000',
+    'pepino'           => '07070000',
+    'berinjela'        => '07093000',
+    'ervilha'          => '07081000',
+    'feijao'           => '07133390',
+    'vagem'            => '07082000',
+    'pimentao'         => '07096000',
+    'pimenta'          => '07096000',
+    'abobrinha'        => '07099990',
+    'abobora'          => '07099990',
+    'moranga'          => '07099990',
+    'chuchu'           => '07099990',
+    'quiabo'           => '07099990',
+    'carambola'        => '08109090',
+    'cebola'           => '07031000',
+    'alho'             => '07032000',
+    'cenoura'          => '07061000',
+    'beterraba'        => '07069000',
+    'inhame'           => '07144000',
+    'batata'           => '07019000',
+    'banana'           => '08039010',
+    'abacate'          => '08044000',
+    'avocado'          => '08044000',
+    'manga'            => '08045010',
+    'goiaba'           => '08045020',
+    'abacaxi'          => '08043000',
+    'maracuja'         => '08109010',
+    'pitaya'           => '08109090',
+    'mamao'            => '08072000',
+    'melao'            => '08071100',
+    'melancia'         => '08071900',
+    'laranja'          => '08051000',
+    'limao'            => '08055090',
+    'mexerica'         => '08052100',
+    'tangerina'        => '08052100',
+    'uva'              => '08061000',
+    'maca'             => '08081000',
+    'pera'             => '08082000',
+    'caqui'            => '08109090',
+    'gengibre'         => '09101100',
+    'acafrao'          => '09103090',
+    'amendoim'         => '12020300',
+    'ketchup'          => '21032000',
+    'molho'            => '21039090',
+    'cara'             => '07141090',
+];
+
+function nfeNormNome(string $s): string {
+    $s = mb_strtolower(trim($s), 'UTF-8');
+    $de = ['à','á','â','ã','ä','å','ç','è','é','ê','ë','ì','í','î','ï','ñ','ò','ó','ô','õ','ö','ù','ú','û','ü','ý','ÿ'];
+    $pa = ['a','a','a','a','a','a','c','e','e','e','e','i','i','i','i','n','o','o','o','o','o','u','u','u','u','y','y'];
+    return preg_replace('/[^a-z0-9 ]/', '', str_replace($de, $pa, $s));
+}
+
+function nfeObterNcm(string $nome, array $mapa): string {
+    $norm = nfeNormNome($nome);
+    uksort($mapa, fn($a, $b) => strlen($b) - strlen($a));
+    foreach ($mapa as $kw => $ncm) {
+        if (str_contains($norm, $kw)) return $ncm;
+    }
+    return '07099990';
+}
+
+function nfeLimparDoc(string $doc): string {
+    return preg_replace('/\D/', '', $doc);
+}
+
+function nfeParsearEndereco(string $txt): array {
+    $cep = $uf = $cidade = $bairro = $xLgr = $nro = '';
+    if (preg_match('/\b(\d{5})[.\-]?(\d{3})\b/', $txt, $m)) {
+        $cep = $m[1] . $m[2];
+    }
+    if (preg_match('/[-,]\s*([A-Z]{2})\s*[,\s]*(CEP|$)/i', $txt, $m)) {
+        $uf = strtoupper($m[1]);
+    }
+    if (empty($uf) && preg_match('/\b([A-Z]{2})\b/', $txt, $m)) {
+        $uf = $m[1];
+    }
+    if ($uf && preg_match('/([^,]+)-' . preg_quote($uf, '/') . '/i', $txt, $m)) {
+        $cidade = trim($m[1]);
+        // remove sub-bairro type labels
+        $cidade = preg_replace('/\b(S[aã]o|de|da|do)\b\s+/iu', '$1 ', $cidade);
+        $cidade = trim($cidade);
+    }
+    $partes = array_map('trim', explode(',', $txt));
+    if (count($partes) >= 1) $xLgr = $partes[0];
+    if (count($partes) >= 2 && preg_match('/^\d/', $partes[1])) {
+        $nro   = $partes[1];
+        $bairro = $partes[2] ?? '';
+    } elseif (count($partes) >= 2) {
+        $bairro = $partes[1];
+        $nro    = 'SN';
+    }
+    return [
+        'xLgr'   => mb_substr(trim($xLgr), 0, 60),
+        'nro'    => mb_substr(trim($nro) ?: 'SN', 0, 10),
+        'xBairro'=> mb_substr(trim($bairro), 0, 60),
+        'xMun'   => mb_substr(trim($cidade), 0, 60),
+        'UF'     => $uf ?: 'SP',
+        'CEP'    => $cep ?: '00000000',
+    ];
+}
+
+function nfeCmunSP(string $cidade): string {
+    static $mapa = [
+        'sao paulo'            => '3550308',
+        'campinas'             => '3509502',
+        'botucatu'             => '3507506',
+        'sao miguel arcanjo'   => '3551702',
+        'indaiatuba'           => '3520509',
+        'casa branca'          => '3510500',
+        'jarinu'               => '3525201',
+        'sete barras'          => '3551405',
+        'sorocaba'             => '3552205',
+        'jundiai'              => '3525904',
+        'itapetininga'         => '3522505',
+        'piracicaba'           => '3538709',
+        'santos'               => '3548500',
+        'ribeirao preto'       => '3543402',
+        'sao jose dos campos'  => '3549904',
+        'guarulhos'            => '3518800',
+        'osasco'               => '3534401',
+        'sao bernardo do campo'=> '3548708',
+        'bauru'                => '3506003',
+        'marilia'              => '3529005',
+    ];
+    $norm = nfeNormNome($cidade);
+    foreach ($mapa as $k => $code) {
+        if ($norm === $k || str_contains($norm, $k)) return $code;
+    }
+    return '9999999';
+}
+
+function nfeCdv(string $chave43): string {
+    $peso = 2; $soma = 0;
+    for ($i = strlen($chave43) - 1; $i >= 0; $i--) {
+        $soma += (int)$chave43[$i] * $peso;
+        $peso = $peso >= 9 ? 2 : $peso + 1;
+    }
+    $r = $soma % 11;
+    return (string)($r < 2 ? 0 : 11 - $r);
+}
+
+function nfeGerarChave(string $cnpj, string $mod, string $serie, string $nNF, string $tpEmis, string $aamm): string {
+    $cUF     = '35';
+    $cNF     = str_pad((string)random_int(10000000, 99999999), 8, '0', STR_PAD_LEFT);
+    $serieP  = str_pad($serie, 3, '0', STR_PAD_LEFT);
+    $nNFP    = str_pad($nNF, 9, '0', STR_PAD_LEFT);
+    $chave43 = $cUF . $aamm . $cnpj . $mod . $serieP . $nNFP . $tpEmis . $cNF;
+    return $chave43 . nfeCdv($chave43);
+}
+
+function nfeXml(string $s): string {
+    return htmlspecialchars($s, ENT_XML1, 'UTF-8');
+}
+
+// ── Parâmetros ────────────────────────────────────────────────────────────────
+$tipo     = (($_GET['tipo'] ?? 'venda') === 'compra') ? 'compra' : 'venda';
+$numeroOs = trim((string)($_GET['numero_os'] ?? ''));
+$vendaId  = (int)($_GET['venda_id'] ?? 0);
+
+if ($numeroOs === '' && $vendaId === 0) {
+    http_response_code(400);
+    exit('Parâmetro numero_os ou venda_id não informado.');
+}
+
+// ── Emitente fixo ─────────────────────────────────────────────────────────────
+$emit = [
+    'CNPJ'   => '45558938000160',
+    'xNome'  => 'AGRO COLITTI LTDA',
+    'xFant'  => 'AGRO COLITTI',
+    'IE'     => '650118162117',
+    'CRT'    => '3',
+    'xLgr'   => 'Acesso Jose Alves Machado',
+    'nro'    => '1139',
+    'xBairro'=> 'Jardim Nova Sao Miguel',
+    'cMun'   => '3551702',
+    'xMun'   => 'Sao Miguel Arcanjo',
+    'UF'     => 'SP',
+    'CEP'    => '18236004',
+    'cPais'  => '1058',
+    'xPais'  => 'BRASIL',
+    'fone'   => '19998153854',
+];
+
+// ── Defaults do destinatário ──────────────────────────────────────────────────
+$dest = [
+    'nome'     => '',
+    'cpf_cnpj' => '',
+    'xLgr'    => '',
+    'nro'     => 'SN',
+    'xBairro' => '',
+    'xMun'    => '',
+    'cMun'    => '9999999',
+    'UF'      => 'SP',
+    'CEP'     => '00000000',
+    'telefone'=> '',
+];
+
+$itens       = [];
+$dataDoc     = date('Y-m-d');
+$vProdTotal  = 0.0;
+
+// ── VENDA ─────────────────────────────────────────────────────────────────────
+if ($tipo === 'venda') {
+    require __DIR__ . '/../vendas/venda_helper.php';
+
+    $where  = ["v.status = 'concluido'"];
+    $params = [];
+    $types  = '';
+    if ($numeroOs !== '') {
+        $where[]  = 'v.numero_os = ?';
+        $params[] = $numeroOs;
+        $types   .= 's';
+    } else {
+        $where[]  = 'v.id = ?';
+        $params[] = $vendaId;
+        $types   .= 'i';
+    }
+
+    $sql  = "SELECT v.*,
+                    p.nome AS produto_nome, p.ncm AS produto_ncm,
+                    p.cfop AS produto_cfop, p.unidade AS produto_unidade,
+                    p.codigo_interno AS produto_cod_int,
+                    p.nfe_codigo_interno AS produto_nfe_cod_int,
+                    p.nfe_descricao AS produto_nfe_descricao,
+                    c.nome AS cliente_nome, c.documento AS cliente_doc,
+                    c.endereco AS cliente_end, c.telefone AS cliente_tel
+             FROM vendas v
+             LEFT JOIN produtos p ON p.id = v.produto_id
+             LEFT JOIN clientes c ON c.id = v.cliente_id
+             WHERE " . implode(' AND ', $where) . " ORDER BY v.id ASC";
+    $stmt = $conexao->prepare($sql);
+    if ($params) $stmt->bind_param($types, ...$params);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+    if (empty($rows)) { http_response_code(404); exit('Venda não encontrada.'); }
+
+    $primeira  = $rows[0];
+    $dataDoc   = (string)($primeira['data_venda'] ?? date('Y-m-d'));
+    $destEnd   = nfeParsearEndereco((string)($primeira['cliente_end'] ?? ''));
+    $dest      = array_merge($dest, [
+        'nome'     => (string)($primeira['cliente_nome'] ?? 'NAO IDENTIFICADO'),
+        'cpf_cnpj' => nfeLimparDoc((string)($primeira['cliente_doc'] ?? '')),
+        'telefone' => preg_replace('/\D/', '', (string)($primeira['cliente_tel'] ?? '')),
+    ], $destEnd);
+    if ($dest['cMun'] === '9999999') $dest['cMun'] = nfeCmunSP($dest['xMun']);
+
+    foreach ($rows as $v) {
+        $qty   = (float)calcularQuantidadeFinalVenda($v);
+        $vProd = ($v['valor_final_editado'] !== null)
+            ? (float)$v['valor_final_editado']
+            : (float)calcularPrecoTotalVenda($v);
+        // Unidade/quantidade/descricao pela regra do tipo comercial (mesma da emissao Focus):
+        //  - oba_embalado: CX, quantidade = numero de caixas, nome "<nome> CX C/<bandejas por caixa>";
+        //  - embalado: BD (quantidade em bandejas); atacado/atacado_convencional: KG.
+        $tipoComercialV = strtolower(trim((string)($v['tipo_comercial'] ?? '')));
+        $gramagemV      = (float)($v['gramagem'] ?? 0);
+        $nomeProdutoV   = (string)($v['produto_nome'] ?? 'PRODUTO');
+        $descFiscalV    = (string)($v['produto_nfe_descricao'] ?? '');
+        if ($tipoComercialV === 'oba_embalado') {
+            $unidade = 'CX';
+            $numCaixasV = (int)($v['num_caixas'] ?? 0);
+            $bandejasV  = (int)($v['bandejas_por_caixa'] ?? 0);
+            $qty = $numCaixasV > 0 ? (float)$numCaixasV : 1.0;
+            $nomeProdutoV = obaDescricaoNfe($nomeProdutoV, $bandejasV);
+        } elseif ($tipoComercialV === 'embalado') {
+            $unidade = 'BD';
+            if ($gramagemV > 0) {
+                $qty = $qty * 1000 / $gramagemV;
+            }
+            $nomeProdutoV = descricaoNfeProdutoSelecionado($descFiscalV, $nomeProdutoV, $gramagemV);
+        } elseif (in_array($tipoComercialV, ['atacado', 'atacado_convencional'], true)) {
+            $unidade = 'KG';
+        } else {
+            $unidade = strtoupper(trim((string)($v['produto_unidade'] ?? 'KG'))) ?: 'KG';
+        }
+        $vUnit = ($qty > 0) ? $vProd / $qty : 0.0;
+        $vProdTotal += $vProd;
+        // NCM: prioriza o do banco, usa keyword map como fallback
+        $ncmDb  = trim((string)($v['produto_ncm'] ?? ''));
+        $ncmFinal = ($ncmDb !== '') ? $ncmDb : nfeObterNcm((string)($v['produto_nome'] ?? ''), $ncmKeywordMap);
+        // CFOP: prioriza o do produto, senão usa padrão por UF
+        $cfopDb   = trim((string)($v['produto_cfop'] ?? ''));
+        $cfopFinal = ($cfopDb !== '') ? $cfopDb : (($dest['UF'] === 'SP') ? '5102' : '6102');
+        // Código interno
+        $codInt  = trim((string)(($v['produto_cod_int'] ?? '') ?: ($v['produto_nfe_cod_int'] ?? '')));
+        $itens[] = [
+            'cod_produto'  => $codInt,
+            'produto_nome' => $nomeProdutoV,
+            'ncm'          => $ncmFinal,
+            'quantidade'   => $qty,
+            'unidade'      => $unidade,
+            'vUnCom'       => $vUnit,
+            'vProd'        => $vProd,
+            'cfop'         => $cfopFinal,
+        ];
+    }
+
+// ── COMPRA ────────────────────────────────────────────────────────────────────
+} else {
+    if ($numeroOs === '') { http_response_code(400); exit('numero_os obrigatório para compras.'); }
+
+    $sql  = "SELECT e.*,
+                    p.nome AS produto_nome, p.ncm AS produto_ncm,
+                    p.cfop AS produto_cfop, p.unidade AS produto_unidade,
+                    p.codigo_interno AS produto_cod_int,
+                    f.nome AS fornecedor_nome, f.cnpj AS fornecedor_doc,
+                    f.endereco AS fornecedor_end, f.telefone AS fornecedor_tel
+             FROM entradas e
+             LEFT JOIN produtos p ON p.id = e.produto_id
+             LEFT JOIN fornecedores f ON f.id = e.fornecedor_id
+             WHERE e.numero_os = ? AND e.tipo = 'entrada_fornecedor'
+             ORDER BY e.id ASC";
+    $stmt = $conexao->prepare($sql);
+    $stmt->bind_param('s', $numeroOs);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+    if (empty($rows)) { http_response_code(404); exit('Compra não encontrada.'); }
+
+    $primeira  = $rows[0];
+    $dataDoc   = (string)($primeira['data_entrada'] ?? date('Y-m-d'));
+    $destEnd   = nfeParsearEndereco((string)($primeira['fornecedor_end'] ?? ''));
+    $dest      = array_merge($dest, [
+        'nome'     => (string)($primeira['fornecedor_nome'] ?? 'NAO IDENTIFICADO'),
+        'cpf_cnpj' => nfeLimparDoc((string)($primeira['fornecedor_doc'] ?? '')),
+        'telefone' => preg_replace('/\D/', '', (string)($primeira['fornecedor_tel'] ?? '')),
+    ], $destEnd);
+    if ($dest['cMun'] === '9999999') $dest['cMun'] = nfeCmunSP($dest['xMun']);
+
+    require_once __DIR__ . '/../previsoes/pedido_compra_helper.php';
+    $snapshot    = pedidoCompraObterSnapshot($conexao, $numeroOs, '');
+    $valorTotalOs = (float)($snapshot['valor_total'] ?? 0);
+    $totalKgOs   = (float)array_sum(array_column($rows, 'quantidade'));
+
+    foreach ($rows as $e) {
+        $qty   = (float)$e['quantidade'];
+        $vProd = ($totalKgOs > 0 && $valorTotalOs > 0)
+            ? round($valorTotalOs * ($qty / $totalKgOs), 2)
+            : 0.0;
+        $vUnit = ($qty > 0 && $vProd > 0) ? $vProd / $qty : 0.0;
+        $vProdTotal += $vProd;
+        $ncmDb    = trim((string)($e['produto_ncm'] ?? ''));
+        $ncmFinal = ($ncmDb !== '') ? $ncmDb : nfeObterNcm((string)($e['produto_nome'] ?? ''), $ncmKeywordMap);
+        $cfopDb   = trim((string)($e['produto_cfop'] ?? ''));
+        $cfopFinal = ($cfopDb !== '') ? $cfopDb : (($dest['UF'] === 'SP') ? '1102' : '2102');
+        $unidade  = strtoupper(trim((string)($e['produto_unidade'] ?? 'KG'))) ?: 'KG';
+        $codInt   = trim((string)(($e['produto_cod_int'] ?? '') ?: ($e['produto_nfe_cod_int'] ?? '')));
+        $itens[] = [
+            'cod_produto'  => $codInt,
+            'produto_nome' => (string)($e['produto_nome'] ?? 'PRODUTO'),
+            'ncm'          => $ncmFinal,
+            'quantidade'   => $qty,
+            'unidade'      => $unidade,
+            'vUnCom'       => $vUnit,
+            'vProd'        => $vProd,
+            'cfop'         => $cfopFinal,
+        ];
+    }
+}
+
+if (empty($itens)) { http_response_code(404); exit('Nenhum item encontrado.'); }
+
+// ── Peso bruto/líquido + dados de embalagem ───────────────────────────────────
+$pesoLiquido   = array_sum(array_column($itens, 'quantidade'));
+$numCaixasNFe  = 0;
+$espCaixaNFe   = 'caixa';
+$pesoCaixaUnit = 0.0;
+
+if ($tipo === 'venda' && !empty($rows)) {
+    $caixaIdNFe   = (int) ($rows[0]['caixa_id']   ?? 0);
+    $numCaixasNFe = (int) ($rows[0]['num_caixas']  ?? 0);
+
+    if ($caixaIdNFe > 0) {
+        $stmtCx = $conexao->prepare("SELECT nome, peso_kg FROM caixas WHERE id = ? LIMIT 1");
+        $stmtCx->bind_param('i', $caixaIdNFe);
+        $stmtCx->execute();
+        $rowCx = $stmtCx->get_result()->fetch_assoc();
+        $stmtCx->close();
+        if ($rowCx) {
+            $espCaixaNFe   = strtolower($rowCx['nome']);   // ex: "plástica p"
+            $pesoCaixaUnit = (float) $rowCx['peso_kg'];
+        }
+    }
+}
+
+// Se não há caixas cadastradas, estimativa com 12% de tara
+$taraCaixas  = $numCaixasNFe > 0 ? ($numCaixasNFe * $pesoCaixaUnit) : round($pesoLiquido * 0.12, 3);
+$pesoBruto   = round($pesoLiquido + $taraCaixas, 3);
+$qVolNFe     = $numCaixasNFe > 0 ? $numCaixasNFe : max(1, (int)ceil($pesoLiquido / 15));
+
+// ── Campos extras de vendas (forma pagamento, frete, vendedor, etc.) ──────────
+$tPagCodigo   = '90'; // padrão: sem pagamento definido
+$vFreteTotal  = 0.0;
+$vendedorNome = '';
+$consideracoes = '';
+$prazoRef     = '';
+
+if ($tipo === 'venda' && !empty($rows)) {
+    $fp = trim((string)($rows[0]['forma_pagamento'] ?? ''));
+    $tPagCodigo = match($fp) {
+        'boleto'   => '15',
+        'pix'      => '17',
+        'deposito' => '16',
+        default    => '90',
+    };
+    $vFreteTotal  = array_sum(array_column($rows, 'frete'));
+    $vendedorNome = trim((string)($rows[0]['vendedor'] ?? ''));
+    $consideracoes = trim((string)($rows[0]['consideracoes'] ?? ''));
+    $prazoRef     = trim((string)($rows[0]['prazo_pagamento'] ?? ''));
+    if ($prazoRef === '') {
+        $prazoRef = trim((string)($rows[0]['prazo_escolhido'] ?? ''));
+    }
+}
+$vNFTotal = $vProdTotal + $vFreteTotal;
+
+// ── Informações complementares ────────────────────────────────────────────────
+$infCplParts = ['Producao organica certificada'];
+if ($numeroOs !== '')    $infCplParts[] = 'OS: ' . $numeroOs;
+if ($vendedorNome !== '') $infCplParts[] = 'Vendedor: ' . $vendedorNome;
+if ($prazoRef !== '')    $infCplParts[] = 'Prazo: ' . $prazoRef;
+if ($consideracoes !== '') $infCplParts[] = $consideracoes;
+$infCpl = implode(' | ', $infCplParts);
+
+// ── Chave e numeração ─────────────────────────────────────────────────────────
+// nNF sequencial: lê e incrementa o contador na tabela nfe_controle (FOR UPDATE evita
+// que dois downloads simultâneos recebam o mesmo número).
+// Fallback para hash+time caso a migração ainda não tenha sido executada.
+$nNFStr = '1';
+try {
+    $conexao->begin_transaction();
+    $stmtNnf = $conexao->prepare("SELECT ultimo_nnf FROM nfe_controle WHERE id = 1 FOR UPDATE");
+    $stmtNnf->execute();
+    $rowNnf  = $stmtNnf->get_result()->fetch_assoc();
+    $stmtNnf->close();
+    $nNFInt  = ((int)($rowNnf['ultimo_nnf'] ?? 0)) + 1;
+    $stmtUpd = $conexao->prepare("UPDATE nfe_controle SET ultimo_nnf = ? WHERE id = 1");
+    $stmtUpd->bind_param('i', $nNFInt);
+    $stmtUpd->execute();
+    $stmtUpd->close();
+    $conexao->commit();
+    $nNFStr = (string)$nNFInt;
+} catch (Throwable $e) {
+    if ($conexao->inTransaction()) $conexao->rollback();
+    // Tabela nfe_controle não existe ainda — roda migrar_nfe_controle.php primeiro
+    $nNFStr = (string)(abs(crc32($tipo . '|' . $numeroOs . '|' . $vendaId . '|' . time())) % 999999999 + 1);
+}
+$aamm     = date('ym', strtotime($dataDoc));
+$tpNF     = ($tipo === 'venda') ? '1' : '0';
+$natOp    = ($tipo === 'venda') ? 'VENDA DE MERCADORIA' : 'COMPRA PARA COMERCIALIZACAO';
+$chave44  = nfeGerarChave($emit['CNPJ'], '55', '1', $nNFStr, '1', $aamm);
+$cNF      = substr($chave44, 35, 8);
+$cDV      = substr($chave44, -1);
+$idNFe    = 'NFe' . $chave44;
+$dhEmi   = date('Y-m-d', strtotime($dataDoc)) . 'T00:00:00-03:00';
+
+// Data de saída/entrega (dhSaiEnt) — obrigatório SEBRAE
+// Para vendas: usa previsao_entrega se existir, senão data_venda
+// Para compras: usa data_entrada
+if ($tipo === 'venda' && !empty($rows)) {
+    $dtSaida = trim((string)($rows[0]['previsao_entrega'] ?? ''));
+    if ($dtSaida === '' || $dtSaida === '0000-00-00') {
+        $dtSaida = $dataDoc;
+    }
+} else {
+    $dtSaida = $dataDoc; // compras: mesma data da entrada
+}
+$dhSaiEnt = date('Y-m-d', strtotime($dtSaida)) . 'T00:00:00-03:00';
+
+$idDest  = ($dest['UF'] === 'SP') ? '1' : '2';
+
+$docLen     = strlen($dest['cpf_cnpj']);
+$destDocTag = ($docLen === 11) ? 'CPF' : 'CNPJ';
+$destDocVal = $dest['cpf_cnpj'];
+
+// ── Download XML ──────────────────────────────────────────────────────────────
+$nomeArq = 'nfe_' . ($tipo === 'venda' ? 'venda' : 'compra') . '_'
+         . ($numeroOs ?: $vendaId) . '_' . date('Ymd_His') . '.xml';
+header('Content-Type: application/xml; charset=UTF-8');
+header('Content-Disposition: attachment; filename="' . $nomeArq . '"');
+header('Cache-Control: no-cache');
+
+echo '<?xml version="1.0" encoding="UTF-8"?>';
+?><NFe xmlns="http://www.portalfiscal.inf.br/nfe">
+<infNFe versao="4.00" Id="<?= nfeXml($idNFe) ?>">
+<ide>
+  <cUF>35</cUF>
+  <cNF><?= nfeXml($cNF) ?></cNF>
+  <natOp><?= nfeXml($natOp) ?></natOp>
+  <mod>55</mod>
+  <serie>1</serie>
+  <nNF><?= nfeXml($nNFStr) ?></nNF>
+  <dhEmi><?= nfeXml($dhEmi) ?></dhEmi>
+  <dhSaiEnt><?= nfeXml($dhSaiEnt) ?></dhSaiEnt>
+  <tpNF><?= $tpNF ?></tpNF>
+  <idDest><?= $idDest ?></idDest>
+  <cMunFG><?= nfeXml($emit['cMun']) ?></cMunFG>
+  <tpImp>1</tpImp>
+  <tpEmis>1</tpEmis>
+  <cDV><?= nfeXml($cDV) ?></cDV>
+  <tpAmb>1</tpAmb>
+  <finNFe>1</finNFe>
+  <indFinal>1</indFinal>
+  <indPres>9</indPres>
+  <procEmi>0</procEmi>
+  <verProc>1.0</verProc>
+</ide>
+<emit>
+  <CNPJ><?= nfeXml($emit['CNPJ']) ?></CNPJ>
+  <xNome><?= nfeXml($emit['xNome']) ?></xNome>
+  <xFant><?= nfeXml($emit['xFant']) ?></xFant>
+  <enderEmit>
+    <xLgr><?= nfeXml($emit['xLgr']) ?></xLgr>
+    <nro><?= nfeXml($emit['nro']) ?></nro>
+    <xBairro><?= nfeXml($emit['xBairro']) ?></xBairro>
+    <cMun><?= nfeXml($emit['cMun']) ?></cMun>
+    <xMun><?= nfeXml($emit['xMun']) ?></xMun>
+    <UF><?= nfeXml($emit['UF']) ?></UF>
+    <CEP><?= nfeXml($emit['CEP']) ?></CEP>
+    <cPais><?= nfeXml($emit['cPais']) ?></cPais>
+    <xPais><?= nfeXml($emit['xPais']) ?></xPais>
+    <fone><?= nfeXml($emit['fone']) ?></fone>
+  </enderEmit>
+  <IE><?= nfeXml($emit['IE']) ?></IE>
+  <CRT><?= nfeXml($emit['CRT']) ?></CRT>
+</emit>
+<dest>
+  <<?= $destDocTag ?>><?= nfeXml($destDocVal) ?></<?= $destDocTag ?>>
+  <xNome><?= nfeXml(mb_substr($dest['nome'], 0, 60)) ?></xNome>
+  <enderDest>
+    <xLgr><?= nfeXml($dest['xLgr'] ?: 'NAO INFORMADO') ?></xLgr>
+    <nro><?= nfeXml($dest['nro'] ?: 'SN') ?></nro>
+    <xBairro><?= nfeXml($dest['xBairro'] ?: 'NAO INFORMADO') ?></xBairro>
+    <cMun><?= nfeXml($dest['cMun']) ?></cMun>
+    <xMun><?= nfeXml($dest['xMun'] ?: 'NAO INFORMADO') ?></xMun>
+    <UF><?= nfeXml($dest['UF']) ?></UF>
+    <CEP><?= nfeXml($dest['CEP']) ?></CEP>
+    <cPais>1058</cPais>
+    <xPais>BRASIL</xPais>
+    <?php if (!empty($dest['telefone'])): ?><fone><?= nfeXml($dest['telefone']) ?></fone><?php endif; ?>
+  </enderDest>
+  <indIEDest>9</indIEDest>
+</dest>
+<?php foreach ($itens as $i => $item):
+    $nItem  = $i + 1;
+    $qCom    = number_format($item['quantidade'], 4, '.', '');
+    $vUnCom  = number_format($item['vUnCom'], 4, '.', '');
+    $vProd   = number_format($item['vProd'], 2, '.', '');
+    $unidade = $item['unidade'] ?? 'KG';
+    $cProd   = $item['cod_produto'] !== '' ? $item['cod_produto'] : str_pad((string)$nItem, 3, '0', STR_PAD_LEFT);
+?>
+<det nItem="<?= $nItem ?>">
+  <prod>
+    <cProd><?= nfeXml(mb_substr($cProd, 0, 60)) ?></cProd>
+    <cEAN>SEM GTIN</cEAN>
+    <xProd><?= nfeXml(mb_substr($item['produto_nome'], 0, 120)) ?></xProd>
+    <NCM><?= nfeXml($item['ncm']) ?></NCM>
+    <CFOP><?= nfeXml($item['cfop']) ?></CFOP>
+    <uCom><?= nfeXml($unidade) ?></uCom>
+    <qCom><?= $qCom ?></qCom>
+    <vUnCom><?= $vUnCom ?></vUnCom>
+    <vProd><?= $vProd ?></vProd>
+    <vDesc>0.00</vDesc>
+    <cEANTrib>SEM GTIN</cEANTrib>
+    <uTrib><?= nfeXml($unidade) ?></uTrib>
+    <qTrib><?= $qCom ?></qTrib>
+    <vUnTrib><?= $vUnCom ?></vUnTrib>
+    <indTot>1</indTot>
+  </prod>
+  <imposto>
+    <vTotTrib>0.00</vTotTrib>
+    <ICMS>
+      <ICMS40>
+        <orig>0</orig>
+        <CST>40</CST>
+      </ICMS40>
+    </ICMS>
+    <PIS>
+      <PISNT>
+        <CST>07</CST>
+      </PISNT>
+    </PIS>
+    <COFINS>
+      <COFINSNT>
+        <CST>07</CST>
+      </COFINSNT>
+    </COFINS>
+  </imposto>
+</det>
+<?php endforeach; ?>
+<total>
+  <ICMSTot>
+    <vBC>0.00</vBC>
+    <vICMS>0.00</vICMS>
+    <vICMSDeson>0.00</vICMSDeson>
+    <vFCP>0.00</vFCP>
+    <vBCST>0.00</vBCST>
+    <vST>0.00</vST>
+    <vFCPST>0.00</vFCPST>
+    <vFCPSTRet>0.00</vFCPSTRet>
+    <vProd><?= number_format($vProdTotal, 2, '.', '') ?></vProd>
+    <vFrete><?= number_format($vFreteTotal, 2, '.', '') ?></vFrete>
+    <vSeg>0.00</vSeg>
+    <vDesc>0.00</vDesc>
+    <vII>0.00</vII>
+    <vIPI>0.00</vIPI>
+    <vIPIDevol>0.00</vIPIDevol>
+    <vPIS>0.00</vPIS>
+    <vCOFINS>0.00</vCOFINS>
+    <vOutro>0.00</vOutro>
+    <vNF><?= number_format($vNFTotal, 2, '.', '') ?></vNF>
+    <vTotTrib>0.00</vTotTrib>
+  </ICMSTot>
+</total>
+<transp>
+  <modFrete>9</modFrete>
+  <vol>
+    <qVol><?= $qVolNFe ?></qVol>
+    <esp><?= htmlspecialchars($espCaixaNFe) ?></esp>
+    <marca>AGRO COLITTI</marca>
+    <pesoL><?= number_format($pesoLiquido, 3, '.', '') ?></pesoL>
+    <pesoB><?= number_format($pesoBruto, 3, '.', '') ?></pesoB>
+  </vol>
+</transp>
+<pag>
+  <detPag>
+    <tPag><?= nfeXml($tPagCodigo) ?></tPag>
+    <vPag><?= number_format($vNFTotal, 2, '.', '') ?></vPag>
+  </detPag>
+</pag>
+<infAdic>
+  <infCpl><?= nfeXml($infCpl) ?></infCpl>
+</infAdic>
+</infNFe>
+</NFe>

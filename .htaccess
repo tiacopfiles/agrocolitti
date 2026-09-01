@@ -1,0 +1,7 @@
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+<FilesMatch "^(composer\.(json|lock)|.*\.sql)$">
+    Require all denied
+</FilesMatch>

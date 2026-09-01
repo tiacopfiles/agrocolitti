@@ -1,0 +1,20 @@
+.wizard-steps{display:flex;gap:8px;margin:0 0 20px;flex-wrap:wrap}
+.wizard-step{background:#eef3ef;color:#54705a;border-radius:999px;padding:8px 12px;font-size:13px;font-weight:700}
+.wizard-step.is-active{background:#1b5e20;color:#fff}
+.wizard-panel,
+.wizard-panel.field-grid{display:none}
+.wizard-panel.is-active,
+.wizard-panel.field-grid.is-active{display:grid}
+.wizard-actions{grid-column:1/-1;display:flex;justify-content:flex-end;gap:10px;margin-top:12px}
+.wizard-review{grid-column:1/-1;background:#f6f8f6;border:1px solid #dfe8df;border-radius:10px;padding:16px}
+.wizard-review h3{margin:0 0 12px;color:#1b5e20;font-size:16px}
+.wizard-review-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.wizard-review-item{font-size:13px;color:#555}
+.wizard-review-item strong{display:block;color:#222;margin-top:3px}
+.fiscal-note{grid-column:1/-1;background:#e8f5e9;border:1px solid #b8dfbe;color:#1b5e20;padding:10px 12px;border-radius:8px;font-size:13px}
+.fiscal-badge{display:inline-flex;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:700;background:#fff3cd;color:#805400}
+.fiscal-badge.ok{background:#e8f5e9;color:#1b5e20}
+.field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.field-grid .full{grid-column:1/-1}
+.ie-wrap.is-hidden{display:none}
+@media(max-width:768px){.wizard-review-grid,.field-grid{grid-template-columns:1fr}.wizard-actions{flex-direction:column-reverse}.wizard-actions button{width:100%}}

@@ -1,0 +1,566 @@
+<?php
+
+const CONTAS_DESTINO_HOST = '192.168.0.220';
+const CONTAS_DESTINO_PORT = 3306;
+const CONTAS_DESTINO_USER = 'root';
+const CONTAS_DESTINO_PASS = '';
+const CONTAS_DESTINO_DB = 'contas';
+const CONTAS_ENVIO_HABILITADO = true;
+
+const CONTAS_FIXO_TIPO = 'Nota Fiscal';
+const CONTAS_FIXO_CATEGORIA = 'Despesas Sítio';
+const CONTAS_FIXO_CONTA = 'Agro Colitti R';
+const CONTAS_FIXO_SITUACAO = 'aberto';
+const CONTAS_FIXO_CENTROCUSTO = 'Operacional';
+
+function contasJsonResponse(array $payload, int $status = 200): void
+{
+    http_response_code($status);
+    header('Content-Type: application/json; charset=UTF-8');
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+function contasConnectDestino(): mysqli
+{
+    mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+    $db = new mysqli(CONTAS_DESTINO_HOST, CONTAS_DESTINO_USER, CONTAS_DESTINO_PASS, CONTAS_DESTINO_DB, CONTAS_DESTINO_PORT);
+    $db->set_charset('utf8');
+
+    $res = $db->query('SELECT DATABASE() AS db');
+    $row = $res->fetch_assoc();
+    $activeDb = (string) ($row['db'] ?? '');
+    if ($activeDb !== CONTAS_DESTINO_DB) {
+        throw new RuntimeException('Trava critica: banco destino ativo nao e ' . CONTAS_DESTINO_DB . '. Ativo: ' . $activeDb);
+    }
+
+    return $db;
+}
+
+function contasActiveAgroDb(mysqli $conexao): string
+{
+    $res = $conexao->query('SELECT DATABASE() AS db');
+    $row = $res ? $res->fetch_assoc() : [];
+    return (string) ($row['db'] ?? '');
+}
+
+function contasAssertAgroAllowed(mysqli $conexao): void
+{
+    $activeDb = contasActiveAgroDb($conexao);
+    if ($activeDb !== 'agrocolitti') {
+        throw new RuntimeException('Trava critica: banco AgroColitti ativo nao permitido. Ativo: ' . $activeDb);
+    }
+}
+
+function contasAssertEnvioHabilitado(): void
+{
+    if (!CONTAS_ENVIO_HABILITADO) {
+        throw new RuntimeException('Envio bloqueado: sistema antigo ainda esta em preparacao e validacao.');
+    }
+}
+
+function contasNormalizeDoc(?string $value): string
+{
+    return preg_replace('/\D+/', '', (string) $value);
+}
+
+function contasMoney(float $value): string
+{
+    return number_format($value, 2, '.', '');
+}
+
+function contasParsePayload(?string $json): array
+{
+    $payload = $json ? json_decode($json, true) : null;
+    return is_array($payload) ? $payload : [];
+}
+
+function contasPedidoCompraSnapshot(?string $json): array
+{
+    $snapshot = $json ? json_decode($json, true) : null;
+    return is_array($snapshot) ? $snapshot : [];
+}
+
+function contasNfeValor(array $payload, array $doc = []): float
+{
+    if (($doc['tipo_emissao'] ?? '') === 'saida_abate_sem_entrada') {
+        $snapshot = contasPedidoCompraSnapshot($doc['pedido_snapshot_json'] ?? null);
+        if (isset($snapshot['valor_total_original'])) return round((float) $snapshot['valor_total_original'], 2);
+        if (isset($snapshot['valor_total'])) return round((float) $snapshot['valor_total'], 2);
+    }
+    if (isset($payload['valor_total'])) return round((float) $payload['valor_total'], 2);
+    if (isset($payload['valor_produtos'])) return round((float) $payload['valor_produtos'], 2);
+
+    $total = 0.0;
+    foreach (($payload['items'] ?? $payload['itens'] ?? []) as $item) {
+        if (is_array($item)) $total += (float) ($item['valor_bruto'] ?? 0);
+    }
+    return round($total, 2);
+}
+
+function contasNfeNumero(array $doc, array $payload): string
+{
+    $numero = trim((string) ($doc['numero_nfe'] ?? ''));
+    if ($numero === '') $numero = trim((string) ($payload['numero'] ?? ''));
+    return $numero;
+}
+
+function contasFornecedorNome(array $doc, array $payload): string
+{
+    $nome = trim((string) ($doc['fornecedor_razao'] ?? ''));
+    if ($nome === '') $nome = trim((string) ($doc['fornecedor_nome'] ?? ''));
+    if ($nome === '') $nome = trim((string) ($payload['nome_destinatario'] ?? $payload['nome_emitente'] ?? ''));
+    return $nome;
+}
+
+function contasFornecedorDocumento(array $doc, array $payload): string
+{
+    foreach (['fornecedor_nfe_cnpj', 'fornecedor_cnpj', 'fornecedor_nfe_cpf'] as $key) {
+        $value = trim((string) ($doc[$key] ?? ''));
+        if ($value !== '') return $value;
+    }
+    foreach (['cnpj_destinatario', 'cpf_destinatario', 'cnpj_emitente', 'cpf_emitente'] as $key) {
+        $value = trim((string) ($payload[$key] ?? ''));
+        if ($value !== '') return $value;
+    }
+    return '';
+}
+
+function contasDocumentoLegado(string $documento): string
+{
+    return strlen(contasNormalizeDoc($documento)) === 11 ? '001' : $documento;
+}
+
+function contasFormatCnpj(string $documento): string
+{
+    $digits = contasNormalizeDoc($documento);
+    if (strlen($digits) !== 14) return $documento;
+    return substr($digits, 0, 2) . '.' . substr($digits, 2, 3) . '.' . substr($digits, 5, 3) . '/' . substr($digits, 8, 4) . '-' . substr($digits, 12, 2);
+}
+
+function contasNormalizeName(?string $value): string
+{
+    return preg_replace('/\s+/', ' ', mb_strtoupper(trim((string) $value), 'UTF-8'));
+}
+
+function contasFindFornecedorDestino(mysqli $destino, string $documento, string $razaoSocial): ?array
+{
+    $digits = contasNormalizeDoc($documento);
+    if (strlen($digits) !== 14) return null;
+
+    $sql = "
+        SELECT id, cnpj, nomefantasia, razaosocial
+        FROM fornecedor
+        WHERE REPLACE(REPLACE(REPLACE(REPLACE(cnpj, '.', ''), '/', ''), '-', ''), ' ', '') = ?
+        ORDER BY id DESC
+        LIMIT 1
+    ";
+    $stmt = $destino->prepare($sql);
+    $stmt->bind_param('s', $digits);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return $row ?: null;
+}
+
+function contasFindFornecedorCpfDestino(mysqli $destino, string $razaoSocial): ?array
+{
+    $razaoSocial = contasNormalizeName($razaoSocial);
+    if ($razaoSocial === '') return null;
+
+    $sql = "
+        SELECT id, cnpj, nomefantasia, razaosocial
+        FROM fornecedor
+        WHERE REPLACE(REPLACE(REPLACE(cnpj, '.', ''), '/', ''), '-', '') = '001'
+          AND UPPER(TRIM(razaosocial)) = ?
+        ORDER BY id DESC
+        LIMIT 1
+    ";
+    $stmt = $destino->prepare($sql);
+    $stmt->bind_param('s', $razaoSocial);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return $row ?: null;
+}
+
+function contasEnsureFornecedorDestino(mysqli $destino, string $documento, string $nomeAgro): array
+{
+    $digits = contasNormalizeDoc($documento);
+    $nomeAgro = trim($nomeAgro);
+
+    if (strlen($digits) === 11) {
+        if ($nomeAgro === '') {
+            throw new RuntimeException('Fornecedor CPF sem nome para cadastro no contas.');
+        }
+
+        $fornecedorCpf = contasFindFornecedorCpfDestino($destino, $nomeAgro);
+        if ($fornecedorCpf) {
+            $nomeContas = trim((string) ($fornecedorCpf['nomefantasia'] ?? ''));
+            if ($nomeContas === '') $nomeContas = trim((string) ($fornecedorCpf['razaosocial'] ?? ''));
+
+            return [
+                'aplicado' => true,
+                'acao' => 'existente_cpf_001',
+                'fornecedor' => $fornecedorCpf,
+                'nome_contas' => $nomeContas !== '' ? $nomeContas : $nomeAgro,
+            ];
+        }
+
+        $stmt = $destino->prepare("
+            INSERT INTO fornecedor
+                (cnpj, nomefantasia, razaosocial, endereco, cidade, estado, bairro, cep, telefone1, telefone2)
+            VALUES
+                ('001', ?, ?, '', '', '', '', '', '', '')
+        ");
+        $stmt->bind_param('ss', $nomeAgro, $nomeAgro);
+        $stmt->execute();
+        $fornecedorId = (int) $stmt->insert_id;
+        $stmt->close();
+
+        return [
+            'aplicado' => true,
+            'acao' => 'criado_cpf_001',
+            'fornecedor' => [
+                'id' => $fornecedorId,
+                'cnpj' => '001',
+                'nomefantasia' => $nomeAgro,
+                'razaosocial' => $nomeAgro,
+            ],
+            'nome_contas' => $nomeAgro,
+        ];
+    }
+
+    if (strlen($digits) !== 14) {
+        return [
+            'aplicado' => false,
+            'motivo' => 'documento_nao_cnpj',
+            'fornecedor' => null,
+        ];
+    }
+
+    $fornecedor = contasFindFornecedorDestino($destino, $documento, $nomeAgro);
+    if ($fornecedor) {
+        $nomeContas = trim((string) ($fornecedor['nomefantasia'] ?? ''));
+        if ($nomeContas === '') $nomeContas = trim((string) ($fornecedor['razaosocial'] ?? ''));
+
+        return [
+            'aplicado' => true,
+            'acao' => 'existente',
+            'fornecedor' => $fornecedor,
+            'nome_contas' => $nomeContas !== '' ? $nomeContas : $nomeAgro,
+        ];
+    }
+
+    if ($nomeAgro === '') {
+        throw new RuntimeException('Fornecedor sem nome para cadastro no contas.');
+    }
+
+    $cnpjFormatado = contasFormatCnpj($digits);
+    $stmt = $destino->prepare("
+        INSERT INTO fornecedor
+            (cnpj, nomefantasia, razaosocial, endereco, cidade, estado, bairro, cep, telefone1, telefone2)
+        VALUES
+            (?, ?, ?, '', '', '', '', '', '', '')
+    ");
+    $stmt->bind_param('sss', $cnpjFormatado, $nomeAgro, $nomeAgro);
+    $stmt->execute();
+    $fornecedorId = (int) $stmt->insert_id;
+    $stmt->close();
+
+    return [
+        'aplicado' => true,
+        'acao' => 'criado',
+        'fornecedor' => [
+            'id' => $fornecedorId,
+            'cnpj' => $cnpjFormatado,
+            'nomefantasia' => $nomeAgro,
+            'razaosocial' => $nomeAgro,
+        ],
+        'nome_contas' => $nomeAgro,
+    ];
+}
+
+function contasApplyFornecedorDestino(array $item, array $fornecedorDestino): array
+{
+    $item['snapshot']['fornecedor']['cadastro_contas'] = $fornecedorDestino;
+    if (empty($fornecedorDestino['aplicado']) || empty($fornecedorDestino['fornecedor'])) {
+        return $item;
+    }
+
+    $nomeContas = (string) ($fornecedorDestino['nome_contas'] ?? $item['lancamento']['nomefantasia']);
+    $cnpjContas = (string) ($fornecedorDestino['fornecedor']['cnpj'] ?? $item['lancamento']['cnpj']);
+
+    $item['fornecedor'] = $nomeContas;
+    $item['cnpj'] = $cnpjContas;
+    $item['lancamento']['nomefantasia'] = $nomeContas;
+    $item['lancamento']['cnpj'] = $cnpjContas;
+    $item['snapshot']['lancamento']['nomefantasia'] = $nomeContas;
+    $item['snapshot']['lancamento']['cnpj'] = $cnpjContas;
+
+    return $item;
+}
+
+function contasGetLancamentoDestino(mysqli $destino, int $destinoId): ?array
+{
+    $stmt = $destino->prepare("SELECT id, cnpj, nomefantasia FROM lancamentos WHERE id = ? LIMIT 1");
+    $stmt->bind_param('i', $destinoId);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+
+    return $row ?: null;
+}
+
+function contasGarantirFornecedorNoLancamento(mysqli $destino, int $destinoId, string $nomeFantasia, string $cnpj): array
+{
+    $nomeFantasia = trim($nomeFantasia);
+    $cnpj = trim($cnpj);
+    if ($destinoId <= 0 || $nomeFantasia === '') {
+        throw new RuntimeException('Lancamento destino sem fornecedor valido para conferencia.');
+    }
+
+    $row = contasGetLancamentoDestino($destino, $destinoId);
+    if (!$row) {
+        throw new RuntimeException('Lancamento destino nao encontrado apos insert.');
+    }
+
+    $nomeAtual = trim((string) ($row['nomefantasia'] ?? ''));
+    if ($nomeAtual === '') {
+        $stmt = $destino->prepare("UPDATE lancamentos SET nomefantasia = ?, cnpj = ? WHERE id = ?");
+        $stmt->bind_param('ssi', $nomeFantasia, $cnpj, $destinoId);
+        $stmt->execute();
+        $stmt->close();
+
+        $row = contasGetLancamentoDestino($destino, $destinoId);
+        $nomeAtual = trim((string) ($row['nomefantasia'] ?? ''));
+    }
+
+    if ($nomeAtual === '') {
+        throw new RuntimeException('Lancamento destino ficou sem nomefantasia apos conferencia.');
+    }
+
+    return $row;
+}
+
+function contasCompetencia(?string $date): string
+{
+    if (!$date) return '';
+    $ts = strtotime($date);
+    return $ts ? date('m/Y', $ts) : '';
+}
+
+function contasFunruralPercentual(string $nome): float
+{
+    return preg_match('/\b(LTDA|COOPERATIVA|COOP)\b/i', $nome) ? 0.0 : 1.63;
+}
+
+function contasValidDate(?string $date): bool
+{
+    if (!$date || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) return false;
+    [$y, $m, $d] = array_map('intval', explode('-', $date));
+    return checkdate($m, $d, $y);
+}
+
+function contasRequestItems(): array
+{
+    $raw = file_get_contents('php://input');
+    $input = json_decode((string) $raw, true);
+    if (!is_array($input)) $input = $_POST;
+    $items = $input['items'] ?? [];
+    return is_array($items) ? $items : [];
+}
+
+function contasFindInputItem(array $items, int $id): array
+{
+    foreach ($items as $item) {
+        if ((int) ($item['id'] ?? $item['origem_id'] ?? 0) === $id) return is_array($item) ? $item : [];
+    }
+    return [];
+}
+
+function contasLoadNfeDocs(mysqli $conexao, array $ids): array
+{
+    $ids = array_values(array_unique(array_filter(array_map('intval', $ids))));
+    if (!$ids) return [];
+
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $types = str_repeat('i', count($ids));
+    $sql = "
+        SELECT d.id, d.ref, d.numero_os, d.tipo_emissao, d.status, d.numero_nfe, d.serie, d.chave_nfe,
+               d.payload_json, d.emitida_em, d.created_at, d.fornecedor_id, d.origem_tipo, d.origem_id,
+               pcd.snapshot_json AS pedido_snapshot_json,
+               f.nome AS fornecedor_nome, f.nfe_nome_razao_social AS fornecedor_razao,
+               f.cnpj AS fornecedor_cnpj, f.nfe_cnpj AS fornecedor_nfe_cnpj, f.nfe_cpf AS fornecedor_nfe_cpf,
+               ci.id AS integracao_id, ci.status AS integracao_status, ci.destino_id AS integracao_destino_id
+        FROM nfe_documentos d
+        LEFT JOIN pedido_compra_documentos pcd
+               ON pcd.numero_os COLLATE utf8mb4_unicode_ci = d.numero_os COLLATE utf8mb4_unicode_ci
+        LEFT JOIN fornecedores f ON f.id = d.fornecedor_id
+        LEFT JOIN contas_integracoes ci
+               ON ci.tipo = 'pagar'
+              AND ci.origem_tabela = 'nfe_documentos'
+              AND ci.origem_id = d.id
+        WHERE d.id IN ($placeholders)
+    ";
+    $stmt = $conexao->prepare($sql);
+    $stmt->bind_param($types, ...$ids);
+    $stmt->execute();
+    $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+    $stmt->close();
+
+    $byId = [];
+    foreach ($rows as $row) $byId[(int) $row['id']] = $row;
+    return $byId;
+}
+
+function contasLegacyDuplicate(mysqli $destino, array $lancamento, string $nomeFornecedor): ?array
+{
+    $sql = "
+        SELECT id, ndocumento, nomefantasia, cnpj, conta, valor, dataemissao
+        FROM lancamentos
+        WHERE ndocumento = ?
+          AND REPLACE(REPLACE(REPLACE(cnpj, '.', ''), '/', ''), '-', '') = ?
+          AND conta = ?
+          AND TRIM(nomefantasia) = TRIM(?)
+        ORDER BY id DESC
+        LIMIT 1
+    ";
+    $cnpj = contasNormalizeDoc($lancamento['cnpj'] ?? '');
+    $stmt = $destino->prepare($sql);
+    $stmt->bind_param('ssss', $lancamento['ndocumento'], $cnpj, $lancamento['conta'], $nomeFornecedor);
+    $stmt->execute();
+    $row = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return $row ?: null;
+}
+
+function contasBuildItem(mysqli $conexao, array $doc, array $input, ?mysqli $destino = null): array
+{
+    $erros = [];
+    $avisos = [];
+    $payload = contasParsePayload($doc['payload_json'] ?? null);
+    $nome = contasFornecedorNome($doc, $payload);
+    $cnpj = contasFornecedorDocumento($doc, $payload);
+    $cnpjLegado = contasDocumentoLegado($cnpj);
+    $numeroAgro = contasNfeNumero($doc, $payload);
+    $numeroDocumentoFornecedor = trim((string) ($input['ndocumento'] ?? $input['documento_fornecedor'] ?? ''));
+    $dataEmissao = trim((string) ($input['dataemissao'] ?? $input['emissao'] ?? $input['data_emissao'] ?? ''));
+    $valor = contasNfeValor($payload, $doc);
+
+    $vencimento = trim((string) ($input['vencimento'] ?? ''));
+    $devolucaoFinal = array_key_exists('devolucao', $input) ? round((float) str_replace(',', '.', (string) $input['devolucao']), 2) : 0.0;
+    $funruralPct = contasFunruralPercentual($nome);
+    $funruralSugerido = round($valor * $funruralPct / 100, 2);
+    $funruralFinal = array_key_exists('funrural', $input) ? round((float) str_replace(',', '.', (string) $input['funrural']), 2) : $funruralSugerido;
+    $descontoTotal = round($funruralFinal + $devolucaoFinal, 2);
+    $valorTotal = round($valor - $descontoTotal, 2);
+
+    if (!in_array((string) ($doc['tipo_emissao'] ?? ''), ['compra', 'saida_abate_sem_entrada'], true)) $erros[] = 'Documento nao e NF-e de compra.';
+    if ((string) ($doc['status'] ?? '') !== 'autorizada') $erros[] = 'NF-e nao esta autorizada.';
+    if ($nome === '') $erros[] = 'Fornecedor ausente.';
+    if (contasNormalizeDoc($cnpj) === '') $erros[] = 'CNPJ/CPF do fornecedor ausente.';
+    if ($numeroAgro === '') $erros[] = 'Numero da NF-e emitida no AgroColitti ausente.';
+    if ($numeroDocumentoFornecedor === '') $erros[] = 'Numero do documento do fornecedor e obrigatorio.';
+    if ($valor <= 0) $erros[] = 'Valor bruto ausente ou zerado.';
+    if (!contasValidDate($dataEmissao)) $erros[] = 'Data de emissao do fornecedor obrigatoria ou invalida.';
+    if (!contasValidDate($vencimento)) $erros[] = 'Vencimento obrigatorio ou invalido.';
+    if ($funruralFinal < 0 || $devolucaoFinal < 0) $erros[] = 'Descontos nao podem ser negativos.';
+    if ($valorTotal < 0) $erros[] = 'Valor liquido negativo.';
+    if ($valorTotal == 0.0) $avisos[] = 'Valor liquido zerado.';
+
+    if (!empty($doc['integracao_id']) && ($doc['integracao_status'] ?? '') === 'enviado') {
+        $erros[] = 'NF-e ja enviada ao contas. ID contas: ' . (int) ($doc['integracao_destino_id'] ?? 0);
+    }
+    if (!empty($doc['integracao_id']) && in_array((string) ($doc['integracao_status'] ?? ''), ['ignorado', 'cancelado'], true)) {
+        $erros[] = 'NF-e marcada como historico ignorado na integracao.';
+    }
+
+    $lancamento = [
+        'ndocumento' => $numeroDocumentoFornecedor,
+        'tipo' => CONTAS_FIXO_TIPO,
+        'nomefantasia' => $nome,
+        'vencimento' => $vencimento,
+        'dataemissao' => $dataEmissao,
+        'obs' => null,
+        'valor' => contasMoney($valor),
+        'datapgto' => null,
+        'categoria' => CONTAS_FIXO_CATEGORIA,
+        'desconto' => contasMoney($descontoTotal),
+        'valortotal' => contasMoney($valorTotal),
+        'parcela' => null,
+        'nparcela' => null,
+        'conta' => CONTAS_FIXO_CONTA,
+        'situacao' => CONTAS_FIXO_SITUACAO,
+        'acrescimo' => null,
+        'competencia' => contasCompetencia($dataEmissao),
+        'centrocusto' => CONTAS_FIXO_CENTROCUSTO,
+        'cnpj' => $cnpjLegado,
+    ];
+
+    $legacyDuplicate = null;
+    if ($destino && !$erros) {
+        $legacyDuplicate = contasLegacyDuplicate($destino, $lancamento, $nome);
+        if ($legacyDuplicate) {
+            $erros[] = 'Possivel duplicidade no contas legado. ID existente: ' . (int) $legacyDuplicate['id'];
+        }
+    }
+
+    $snapshot = [
+        'origem' => [
+            'tabela' => 'nfe_documentos',
+            'id' => (int) $doc['id'],
+            'ref' => (string) ($doc['ref'] ?? ''),
+            'numero_os' => (string) ($doc['numero_os'] ?? ''),
+            'serie' => (string) ($doc['serie'] ?? ''),
+            'chave_nfe' => (string) ($doc['chave_nfe'] ?? ''),
+            'numero_nfe_agro' => $numeroAgro,
+            'tipo_emissao' => (string) ($doc['tipo_emissao'] ?? ''),
+            'valor_origem' => ($doc['tipo_emissao'] ?? '') === 'saida_abate_sem_entrada' ? 'pedido_original_abate_sem_entrada' : 'payload_nfe',
+        ],
+        'fornecedor' => [
+            'nome' => $nome,
+            'cnpj_cpf' => $cnpj,
+            'cnpj_cpf_normalizado' => contasNormalizeDoc($cnpj),
+            'cnpj_legacy' => $cnpjLegado,
+        ],
+        'calculo' => [
+            'valor_bruto' => contasMoney($valor),
+            'funrural_percentual' => contasMoney($funruralPct),
+            'funrural_sugerido' => contasMoney($funruralSugerido),
+            'funrural_final' => contasMoney($funruralFinal),
+            'devolucao_detectada' => contasMoney(0.0),
+            'devolucao_final' => contasMoney($devolucaoFinal),
+            'devolucoes_consideradas' => [],
+            'desconto_total' => contasMoney($descontoTotal),
+            'valor_liquido' => contasMoney($valorTotal),
+        ],
+        'lancamento' => $lancamento,
+        'legacy_duplicate' => $legacyDuplicate,
+    ];
+
+    return [
+        'origem_id' => (int) $doc['id'],
+        'origem_ref' => (string) ($doc['ref'] ?? ''),
+        'ndocumento' => $numeroDocumentoFornecedor,
+        'fornecedor' => $nome,
+        'cnpj' => $cnpjLegado,
+        'status' => $erros ? 'bloqueado' : 'apto',
+        'erros' => $erros,
+        'avisos' => $avisos,
+        'lancamento' => $lancamento,
+        'snapshot' => $snapshot,
+    ];
+}
+
+function contasRecordEvento(mysqli $conexao, ?int $integracaoId, ?int $loteId, string $evento, string $detalhe, array $payload = []): void
+{
+    $payloadJson = $payload ? json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
+    $usuarioId = (int) ($_SESSION['usuario_id'] ?? 0);
+    $stmt = $conexao->prepare("INSERT INTO contas_integracao_eventos (integracao_id, lote_id, evento, detalhe, payload_json, usuario_id) VALUES (?, ?, ?, ?, ?, ?)");
+    $stmt->bind_param('iisssi', $integracaoId, $loteId, $evento, $detalhe, $payloadJson, $usuarioId);
+    $stmt->execute();
+    $stmt->close();
+}
